@@ -18,6 +18,7 @@ import Image, { AuthenticatedImg } from '@/components/image';
 import SvgIcon from '@/components/svg-icon';
 import { SafeImg } from '@/components/safe-img';
 import { MarkdownRemarkPlugins } from '@/constants/markdown-remark-plugins';
+import { rehypeSanitizeAssistantMarkdown } from '@/constants/markdown-rehype-plugins';
 import { IReferenceChunk, IReferenceObject } from '@/interfaces/database/chat';
 import { getExtension } from '@/utils/document-util';
 import { downloadFileFromBlob } from '@/utils/file-util';
@@ -390,7 +391,12 @@ function MarkdownContent({
   return (
     <div dir={dir} className={styles.markdownContentWrapper}>
       <Markdown
-        rehypePlugins={[rehypeRaw, rehypeWrapReference, rehypeKatex]}
+        rehypePlugins={[
+          rehypeRaw,
+          rehypeSanitizeAssistantMarkdown,
+          rehypeWrapReference,
+          rehypeKatex,
+        ]}
         remarkPlugins={MarkdownRemarkPlugins}
         urlTransform={(url, key) => {
           if (
