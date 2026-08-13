@@ -457,6 +457,59 @@ def test_media_blocks_keep_empty_table_with_image(monkeypatch):
     assert media_blocks == [((image, [""]), [])]
 
 
+class _FakeHeadResponse:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (200, True),
+        (404, True),
+        (405, True),
+        (499, True),
+        (500, False),
+        (503, False),
+    ],
+)
+def test_http_endpoint_reachability_uses_status_class(monkeypatch, status_code, expected):
+    module = _load_mineru_parser(monkeypatch)
+    monkeypatch.setattr(module.requests, "head", lambda *_args, **_kwargs: _FakeHeadResponse(status_code))
+
+    assert module.MinerUParser._is_http_endpoint_valid("http://service.local") is expected
+
+
+def test_http_endpoint_network_error_is_unavailable(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+
+    def raise_connection_error(*_args, **_kwargs):
+        raise module.requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr(module.requests, "head", raise_connection_error)
+
+    assert module.MinerUParser._is_http_endpoint_valid("http://service.local") is False
+
+
+@pytest.mark.parametrize(("server_status", "expected_available"), [(404, True), (405, True), (500, False)])
+def test_check_installation_validates_vlm_http_server(monkeypatch, server_status, expected_available):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser(mineru_api="http://mineru.local", mineru_server_url="http://vlm.local")
+
+    def fake_head(url, **_kwargs):
+        return _FakeHeadResponse(200 if url.endswith("/openapi.json") else server_status)
+
+    monkeypatch.setattr(module.requests, "head", fake_head)
+
+    available, reason = parser.check_installation(backend="vlm-http-client")
+
+    assert available is expected_available
+    if expected_available:
+        assert reason == ""
+    else:
+        assert "vlm-http-client server not accessible" in reason
+
+
 class _FakeZipResponse:
     """Stand-in for the streaming response returned by requests.post.
 
@@ -730,6 +783,96 @@ def test_parse_pdf_pipeline_returns_no_independent_media_blocks(monkeypatch, tmp
 
     assert sections == [("Figure caption", "image", "")]
     assert media_blocks == []
+
+
+def _capture_parse_pdf_input(monkeypatch, module, parser, tmp_path, *, filepath, binary):
+    captured = {}
+
+    def capture_run(input_path, output_dir, _options, **_kwargs):
+        input_path = Path(input_path)
+        captured["path"] = input_path
+        captured["bytes"] = input_path.read_bytes()
+        return output_dir
+
+    monkeypatch.setattr(parser, "__images__", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(parser, "_run_mineru", capture_run)
+    monkeypatch.setattr(parser, "_read_output", lambda *_args, **_kwargs: [])
+
+    result = parser.parse_pdf(
+        filepath=filepath,
+        binary=binary,
+        output_dir=str(tmp_path / "output"),
+        delete_output=False,
+    )
+
+    assert result == ([], [])
+    return captured
+
+
+def test_parse_pdf_reads_bytesio_and_cleans_temporary_input(monkeypatch, tmp_path):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    binary = BytesIO(b"bytesio-pdf")
+    binary.seek(len(b"bytesio-pdf"))
+
+    captured = _capture_parse_pdf_input(
+        monkeypatch,
+        module,
+        parser,
+        tmp_path,
+        filepath=tmp_path / "stream input.pdf",
+        binary=binary,
+    )
+
+    assert captured["bytes"] == b"bytesio-pdf"
+    assert " " not in captured["path"].name
+    assert not captured["path"].parent.exists()
+
+
+def test_parse_pdf_treats_empty_bytes_as_binary_input(monkeypatch, tmp_path):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+
+    captured = _capture_parse_pdf_input(
+        monkeypatch,
+        module,
+        parser,
+        tmp_path,
+        filepath=tmp_path / "missing.pdf",
+        binary=b"",
+    )
+
+    assert captured["bytes"] == b""
+    assert not captured["path"].parent.exists()
+
+
+def test_parse_pdf_none_uses_path_object_directly(monkeypatch, tmp_path):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"path-pdf")
+
+    captured = _capture_parse_pdf_input(monkeypatch, module, parser, tmp_path, filepath=source, binary=None)
+
+    assert captured == {"path": source, "bytes": b"path-pdf"}
+    assert source.read_bytes() == b"path-pdf"
+
+
+def test_parse_pdf_copies_spaced_path_without_modifying_original(monkeypatch, tmp_path):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    source = tmp_path / "source document.pdf"
+    source.write_bytes(b"path-pdf")
+    original_mtime = source.stat().st_mtime_ns
+
+    captured = _capture_parse_pdf_input(monkeypatch, module, parser, tmp_path, filepath=source, binary=None)
+
+    assert captured["path"] != source
+    assert captured["path"].name == "sourcedocument.pdf"
+    assert captured["bytes"] == b"path-pdf"
+    assert not captured["path"].parent.exists()
+    assert source.read_bytes() == b"path-pdf"
+    assert source.stat().st_mtime_ns == original_mtime
 
 
 def test_pdf_open_and_render_use_shared_pdfplumber_lock(monkeypatch):

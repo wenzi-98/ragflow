@@ -207,11 +207,11 @@ class MinerUParser(RAGFlowPdfParser):
                     shutil.copyfileobj(src, dst)
 
     @staticmethod
-    def _is_http_endpoint_valid(url, timeout=5):
+    def _is_http_endpoint_valid(url: str, timeout: int = 5) -> bool:
         try:
             response = requests.head(url, timeout=timeout, allow_redirects=True)
-            return response.status_code in [200, 301, 302, 307, 308]
-        except Exception:
+            return response.status_code < 500
+        except requests.RequestException:
             return False
 
     @staticmethod
@@ -269,8 +269,14 @@ class MinerUParser(RAGFlowPdfParser):
             try:
                 server_ok = self._is_http_endpoint_valid(resolved_server)
                 self.logger.info(f"[MinerU] vlm-http-client server check reachable={server_ok} url={resolved_server}")
+                if not server_ok:
+                    reason = f"[MinerU] vlm-http-client server not accessible: {resolved_server}"
+                    self.logger.warning(reason)
+                    return False, reason
             except Exception as exc:
-                self.logger.warning(f"[MinerU] vlm-http-client server probe failed: {resolved_server}: {exc}")
+                reason = f"[MinerU] vlm-http-client server probe failed: {resolved_server}: {exc}"
+                self.logger.warning(reason)
+                return False, reason
 
         return True, reason
 
@@ -666,11 +672,7 @@ class MinerUParser(RAGFlowPdfParser):
         anchor_bbox = self._content_bbox_to_page_space(page_idx, output["bbox"])
         if anchor_bbox is None:
             return []
-        anchor_candidates = [
-            (self._overlap_ratio(anchor_bbox, block["bbox"]), idx, block)
-            for idx, block in enumerate(middle_blocks)
-            if block["type"] == "table" and block["page_idx"] == page_idx
-        ]
+        anchor_candidates = [(self._overlap_ratio(anchor_bbox, block["bbox"]), idx, block) for idx, block in enumerate(middle_blocks) if block["type"] == "table" and block["page_idx"] == page_idx]
         anchor_candidates = [candidate for candidate in anchor_candidates if candidate[0] >= 0.5]
         if not anchor_candidates:
             return []
@@ -980,7 +982,9 @@ class MinerUParser(RAGFlowPdfParser):
 
             section = str(section or "")
             position_tag = self._line_tag(output) if "page_idx" in output and "bbox" in output else ""
-            keep_empty_media = parse_method == "pipeline" and self._has_renderable_position(position_tag) and (output_type == MinerUContentType.IMAGE or (output_type == MinerUContentType.TABLE and table_enable))
+            keep_empty_media = (
+                parse_method == "pipeline" and self._has_renderable_position(position_tag) and (output_type == MinerUContentType.IMAGE or (output_type == MinerUContentType.TABLE and table_enable))
+            )
             if not section and not keep_empty_media:
                 if output_type == MinerUContentType.TABLE:
                     self.logger.warning("[MinerU] Skip empty table without text or renderable image")
@@ -1036,7 +1040,7 @@ class MinerUParser(RAGFlowPdfParser):
     def parse_pdf(
         self,
         filepath: str | PathLike[str],
-        binary: BytesIO | bytes,
+        binary: BytesIO | bytes | None = None,
         callback: Optional[Callable] = None,
         *,
         output_dir: Optional[str] = None,
@@ -1048,11 +1052,12 @@ class MinerUParser(RAGFlowPdfParser):
         page_to: int = MAXIMUM_PAGE_NUMBER,
         **kwargs,
     ) -> tuple:
-        import shutil
-
-        self.outlines = extract_pdf_outlines(binary if binary is not None else filepath)
-        temp_pdf = None
-        created_tmp_dir = False
+        file_path = Path(filepath)
+        binary_bytes = binary.getvalue() if isinstance(binary, BytesIO) else binary
+        self.outlines = extract_pdf_outlines(binary_bytes if binary_bytes is not None else str(file_path))
+        temp_input_dir: Path | None = None
+        out_dir: Path | None = None
+        created_output_dir = False
 
         parser_cfg = kwargs.get("parser_config", {})
         lang = parser_cfg.get("mineru_lang") or kwargs.get("lang") or "English"
@@ -1061,44 +1066,42 @@ class MinerUParser(RAGFlowPdfParser):
         enable_formula = parser_cfg.get("mineru_formula_enable", True)
         enable_table = parser_cfg.get("mineru_table_enable", True)
 
-        # remove spaces, or mineru crash, and _read_output fail too
-        file_path = Path(filepath)
-        pdf_file_name = file_path.stem.replace(" ", "") + ".pdf"
-        pdf_file_path_valid = os.path.join(file_path.parent, pdf_file_name)
-
-        if binary:
-            temp_dir = Path(tempfile.mkdtemp(prefix="mineru_bin_pdf_"))
-            temp_pdf = temp_dir / pdf_file_name
-            with open(temp_pdf, "wb") as f:
-                f.write(binary)
-            pdf = temp_pdf
-            self.logger.info(f"[MinerU] Received binary PDF -> {temp_pdf}")
-            if callback:
-                callback(0.15, f"[MinerU] Received binary PDF -> {temp_pdf}")
-        else:
-            if pdf_file_path_valid != filepath:
-                self.logger.info(f"[MinerU] Remove all space in file name: {pdf_file_path_valid}")
-                shutil.move(filepath, pdf_file_path_valid)
-            pdf = Path(pdf_file_path_valid)
-            if not pdf.exists():
-                if callback:
-                    callback(-1, f"[MinerU] PDF not found: {pdf}")
-                raise FileNotFoundError(f"[MinerU] PDF not found: {pdf}")
-
-        if output_dir:
-            out_dir = Path(output_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            out_dir = Path(tempfile.mkdtemp(prefix="mineru_pdf_"))
-            created_tmp_dir = True
-
-        self.logger.info(f"[MinerU] Output directory: {out_dir} backend={backend} api={self.mineru_api} server_url={server_url or self.mineru_server_url}")
-        if callback:
-            callback(0.15, f"[MinerU] Output directory: {out_dir}")
-
-        self.__images__(pdf, zoomin=1, page_from=page_from, page_to=page_to)
+        pdf_file_name = (file_path.stem.replace(" ", "") or "document") + ".pdf"
 
         try:
+            if binary_bytes is not None:
+                temp_input_dir = Path(tempfile.mkdtemp(prefix="mineru_input_pdf_"))
+                pdf = temp_input_dir / pdf_file_name
+                pdf.write_bytes(binary_bytes)
+                self.logger.info(f"[MinerU] Received binary PDF -> {pdf}")
+                if callback:
+                    callback(0.15, f"[MinerU] Received binary PDF -> {pdf}")
+            else:
+                if not file_path.exists():
+                    if callback:
+                        callback(-1, f"[MinerU] PDF not found: {file_path}")
+                    raise FileNotFoundError(f"[MinerU] PDF not found: {file_path}")
+                if " " in file_path.name:
+                    temp_input_dir = Path(tempfile.mkdtemp(prefix="mineru_input_pdf_"))
+                    pdf = temp_input_dir / pdf_file_name
+                    shutil.copy2(file_path, pdf)
+                    self.logger.info(f"[MinerU] Copied PDF to space-free temporary path: {pdf}")
+                else:
+                    pdf = file_path
+
+            if output_dir:
+                out_dir = Path(output_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                out_dir = Path(tempfile.mkdtemp(prefix="mineru_pdf_"))
+                created_output_dir = True
+
+            self.logger.info(f"[MinerU] Output directory: {out_dir} backend={backend} api={self.mineru_api} server_url={server_url or self.mineru_server_url}")
+            if callback:
+                callback(0.15, f"[MinerU] Output directory: {out_dir}")
+
+            self.__images__(pdf, zoomin=1, page_from=page_from, page_to=page_to)
+
             options = MinerUParseOptions(
                 backend=MinerUBackend(backend),
                 lang=MinerULanguage(mineru_lang_code),
@@ -1123,17 +1126,16 @@ class MinerUParser(RAGFlowPdfParser):
             # resolved, preventing Manual and Paper from processing an image twice.
             return sections, self._transfer_to_media_blocks(outputs, enable_table)
         finally:
-            if temp_pdf and temp_pdf.exists():
+            if temp_input_dir is not None:
                 try:
-                    temp_pdf.unlink()
-                    temp_pdf.parent.rmdir()
-                except Exception:
-                    pass
-            if delete_output and created_tmp_dir and out_dir.exists():
+                    shutil.rmtree(temp_input_dir)
+                except Exception as exc:
+                    self.logger.warning(f"[MinerU] Failed to remove temporary input directory {temp_input_dir}: {exc}")
+            if delete_output and created_output_dir and out_dir is not None and out_dir.exists():
                 try:
                     shutil.rmtree(out_dir)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.logger.warning(f"[MinerU] Failed to remove temporary output directory {out_dir}: {exc}")
 
 
 if __name__ == "__main__":
