@@ -222,7 +222,7 @@ def test_raw_and_manual_route_tables_and_images_only_to_media_blocks(monkeypatch
 def test_pipeline_preserves_text_table_image_text_order(monkeypatch):
     module = _load_mineru_parser(monkeypatch)
     parser = module.MinerUParser()
-    parser.page_sizes = {0: (100.0, 200.0)}
+    parser.page_images = [module.Image.new("RGB", (100, 200), "white")]
     table_html = "<table><tr><td>Table cell</td></tr></table>"
     outputs = [
         {"type": module.MinerUContentType.TEXT, "text": "Before media"},
@@ -265,6 +265,29 @@ def test_pipeline_drops_empty_image_without_crop_position(monkeypatch):
     )
 
     assert sections == []
+
+
+def test_pipeline_keeps_empty_table_with_renderable_position(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    parser.page_images = [_FakePageImage(200, 400)]
+
+    sections = parser._transfer_to_sections(
+        [
+            {
+                "type": module.MinerUContentType.TABLE,
+                "table_body": "",
+                "table_caption": [],
+                "table_footnote": [],
+                "page_idx": 0,
+                "bbox": [100, 100, 900, 900],
+            }
+        ],
+        parse_method="pipeline",
+        table_enable=True,
+    )
+
+    assert sections == [("", "table", "@@1\t20.0\t180.0\t40.0\t360.0##")]
 
 
 def test_transfer_to_sections_keeps_tables_when_media_is_disabled_by_default(monkeypatch):
@@ -330,6 +353,13 @@ def test_build_image_texts_uses_only_mineru_caption_and_footnote(monkeypatch):
     assert not hasattr(parser, "_enhance_images_with_vlm")
 
 
+def test_build_table_text_returns_empty_without_real_content(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+
+    assert parser._build_table_text({"table_body": "", "table_caption": [], "table_footnote": []}) == ""
+
+
 def test_media_blocks_drop_empty_image_without_resource(monkeypatch):
     module = _load_mineru_parser(monkeypatch)
     parser = module.MinerUParser()
@@ -378,6 +408,48 @@ def test_media_blocks_keep_image_without_caption_placeholder(monkeypatch):
                 "type": module.MinerUContentType.IMAGE,
                 "image_caption": [],
                 "image_footnote": [],
+            }
+        ]
+    )
+
+    assert media_blocks == [((image, [""]), [])]
+
+
+def test_media_blocks_drop_empty_table_without_resource(monkeypatch, caplog):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    monkeypatch.setattr(parser, "_resolve_output_image", lambda *_args, **_kwargs: None)
+
+    with caplog.at_level(logging.WARNING, logger=parser.logger.name):
+        media_blocks = parser._transfer_to_media_blocks(
+            [
+                {
+                    "type": module.MinerUContentType.TABLE,
+                    "table_body": "",
+                    "table_caption": [],
+                    "table_footnote": [],
+                }
+            ]
+        )
+
+    assert media_blocks == []
+    assert "Skip empty table without text or renderable image" in caplog.text
+    assert "FAILED TO PARSE TABLE" not in caplog.text
+
+
+def test_media_blocks_keep_empty_table_with_image(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    image = object()
+    monkeypatch.setattr(parser, "_resolve_output_image", lambda *_args, **_kwargs: image)
+
+    media_blocks = parser._transfer_to_media_blocks(
+        [
+            {
+                "type": module.MinerUContentType.TABLE,
+                "table_body": "",
+                "table_caption": [],
+                "table_footnote": [],
             }
         ]
     )
@@ -793,6 +865,52 @@ def test_read_output_enriches_cross_page_table_positions_from_middle_json(monkey
         (0, 20.0, 180.0, 40.0, 360.0),
         (1, 20.0, 180.0, 0.0, 80.0),
     ]
+
+
+def test_read_output_resolves_media_inside_result_directory(monkeypatch, tmp_path):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    image_path = tmp_path / "images" / "figure.png"
+    image_path.parent.mkdir()
+    image_path.write_bytes(b"image")
+    (tmp_path / "sample_content_list.json").write_text(
+        json.dumps([{"type": "image", "img_path": "images/figure.png"}]),
+        encoding="utf-8",
+    )
+
+    outputs = parser._read_output(tmp_path, "sample")
+
+    assert outputs[0]["img_path"] == str(image_path.resolve())
+
+
+def test_read_output_rejects_unsafe_media_paths(monkeypatch, tmp_path):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    outside = tmp_path.parent / "outside.png"
+    outside.write_bytes(b"outside")
+    content_list = tmp_path / "sample_content_list.json"
+
+    for unsafe_path in ("../outside.png", str(outside.resolve()), r"C:\outside.png"):
+        content_list.write_text(json.dumps([{"type": "image", "img_path": unsafe_path}]), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="Unsafe media path"):
+            parser._read_output(tmp_path, "sample")
+
+
+def test_read_output_rejects_media_symlink_escape(monkeypatch, tmp_path):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    outside = tmp_path.parent / "outside-symlink.png"
+    outside.write_bytes(b"outside")
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "figure.png").symlink_to(outside)
+    (tmp_path / "sample_content_list.json").write_text(
+        json.dumps([{"type": "image", "img_path": "images/figure.png"}]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match=r"Unsafe media path \(escape\)"):
+        parser._read_output(tmp_path, "sample")
 
 
 def test_read_output_does_not_enrich_non_table_positions_from_middle_json(monkeypatch, tmp_path):

@@ -861,8 +861,23 @@ class MinerUParser(RAGFlowPdfParser):
         for item in data:
             for key in ("img_path", "table_img_path", "equation_img_path"):
                 if key in item and item[key]:
-                    item[key] = str((subdir / item[key]).resolve())
+                    item[key] = str(self._resolve_result_media_path(subdir, str(item[key])))
         return data
+
+    @staticmethod
+    def _resolve_result_media_path(result_dir: Path, media_path: str) -> Path:
+        """Resolve a relative MinerU media path without leaving its result directory."""
+        normalized_path = media_path.replace("\\", "/")
+        if normalized_path.startswith("/") or re.match(r"^[A-Za-z]:/", normalized_path):
+            raise RuntimeError(f"[MinerU] Unsafe media path (absolute): {media_path}")
+        if ".." in Path(normalized_path).parts:
+            raise RuntimeError(f"[MinerU] Unsafe media path (traversal): {media_path}")
+
+        base_dir = result_dir.resolve()
+        resolved_path = (base_dir / normalized_path).resolve(strict=False)
+        if resolved_path != base_dir and base_dir not in resolved_path.parents:
+            raise RuntimeError(f"[MinerU] Unsafe media path (escape): {media_path}")
+        return resolved_path
 
     def _normalize_output_type(self, output: dict[str, object]) -> MinerUContentType | None:
         raw_type = str(output.get("type", "") or "").strip().lower()
@@ -897,7 +912,7 @@ class MinerUParser(RAGFlowPdfParser):
         parts = [str(output.get("table_body") or "").strip()]
         parts.extend(self._normalize_text_lines(table_caption if isinstance(table_caption, list) else None))
         parts.extend(self._normalize_text_lines(table_footnote if isinstance(table_footnote, list) else None))
-        return "\n".join(part for part in parts if part) or "FAILED TO PARSE TABLE"
+        return "\n".join(part for part in parts if part)
 
     def _load_image_from_path(self, image_path: str | None) -> Optional[Image.Image]:
         if not image_path:
@@ -923,6 +938,13 @@ class MinerUParser(RAGFlowPdfParser):
         except Exception as exc:
             self.logger.warning(f"[MinerU] Failed to crop media fallback image: {exc}")
             return None
+
+    def _has_renderable_position(self, position_tag: str) -> bool:
+        """Return whether a local position tag references at least one rendered page."""
+        if not position_tag or not self.page_images:
+            return False
+        page_count = len(self.page_images)
+        return any(pages and any(0 <= page < page_count for page in pages) for pages, *_bounds in self.extract_positions(position_tag))
 
     def _transfer_to_sections(self, outputs: list[dict[str, Any]], parse_method: str = None, table_enable: bool = False):
         sections = []
@@ -958,7 +980,10 @@ class MinerUParser(RAGFlowPdfParser):
 
             section = str(section or "")
             position_tag = self._line_tag(output) if "page_idx" in output and "bbox" in output else ""
-            if not section and not (parse_method == "pipeline" and output_type == MinerUContentType.IMAGE and position_tag):
+            keep_empty_media = parse_method == "pipeline" and self._has_renderable_position(position_tag) and (output_type == MinerUContentType.IMAGE or (output_type == MinerUContentType.TABLE and table_enable))
+            if not section and not keep_empty_media:
+                if output_type == MinerUContentType.TABLE:
+                    self.logger.warning("[MinerU] Skip empty table without text or renderable image")
                 self.logger.debug("[MinerU] Skip empty section after normalization: type=%s", output.get("type"))
                 continue
 
@@ -989,7 +1014,10 @@ class MinerUParser(RAGFlowPdfParser):
                     continue
                 table_text = self._build_table_text(output)
                 table_image = self._resolve_output_image(output, position_tag, ("table_img_path", "img_path"))
-                tables.append(((table_image, table_text), positions))
+                if not table_text and table_image is None:
+                    self.logger.warning("[MinerU] Skip empty table without text or renderable image")
+                    continue
+                tables.append(((table_image, table_text if table_text else [""]), positions))
                 table_count += 1
                 continue
 

@@ -104,6 +104,17 @@ def test_tokenize_table_keeps_image_without_caption(lightweight_tokenizer):
     assert chunks[0]["image"] is image
 
 
+def test_tokenize_table_treats_empty_visual_table_as_image(lightweight_tokenizer):
+    image = object()
+
+    chunks = nlp.tokenize_table([((image, ""), [])], {"docnm_kwd": "document.pdf"}, eng=True)
+
+    assert len(chunks) == 1
+    assert chunks[0]["doc_type_kwd"] == "image"
+    assert chunks[0]["content_with_weight"] == ""
+    assert chunks[0]["image"] is image
+
+
 def test_pdf_media_context_preserves_items_without_positions(monkeypatch):
     parser_module = ModuleType("deepdoc.parser")
     setattr(parser_module, "PdfParser", type("PdfParser", (), {"extract_positions": staticmethod(lambda _text: [])}))
