@@ -39,7 +39,7 @@ export const MODEL_FIELD_SCHEMA: AddCustomModelDialogFields[] = [
     name: 'model_types',
     label: 'modelType',
     type: 'multi-select',
-    required: false,
+    required: true,
     defaultValue: [],
     options: [
       { value: 'chat', label: 'modelTypes.chat' },

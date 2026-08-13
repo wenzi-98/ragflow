@@ -54,6 +54,7 @@ export function SavedModeCard({
   formRef,
   handleVerify,
   handleDelete,
+  handleInstanceModelsChange,
   handleInstanceModelsEdited,
   providerName,
   instanceName,
@@ -61,11 +62,13 @@ export function SavedModeCard({
   onRename,
   instance,
   instanceDetailsLoaded,
-  modelInfoRef,
+  modelInfoLoaded,
   draftName,
   open,
   setOpen,
   verifyTransform,
+  buildInstanceUpdatePayload,
+  getModelsSectionValues,
 }: SavedModeCardProps) {
   const { t } = useTranslation();
   const { t: tSetting } = useTranslate('setting');
@@ -93,11 +96,6 @@ export function SavedModeCard({
       return () => cancelAnimationFrame(id);
     }
   }, [renaming]);
-
-  const startRename = () => {
-    setRenameValue(editedInstanceName);
-    setRenaming(true);
-  };
 
   const commitRename = () => {
     setRenaming(false);
@@ -216,11 +214,14 @@ export function SavedModeCard({
                 hideActions={false}
                 hideIfEmpty={false}
                 instanceDetailsLoaded={instanceDetailsLoaded}
-                getFormValues={() => formRef.current?.getValues?.() ?? {}}
+                getFormValues={getModelsSectionValues}
                 verifyTransform={verifyTransform}
-                onInstanceModelsChange={(info) => {
-                  modelInfoRef.current = info;
-                }}
+                buildInstanceUpdatePayload={
+                  instanceDetailsLoaded && modelInfoLoaded
+                    ? buildInstanceUpdatePayload
+                    : undefined
+                }
+                onInstanceModelsChange={handleInstanceModelsChange}
                 onInstanceModelsEdited={handleInstanceModelsEdited}
               />
             </div>

@@ -156,7 +156,7 @@ export const AddCustomModelDialog = ({
           type: FormFieldType.Switch,
           required: field.required,
           defaultValue: defaultValue ?? false,
-          disabled: field.disabled,
+          disabled: loading || field.disabled,
           labelClassName: '!mb-0',
         };
       }
@@ -168,7 +168,7 @@ export const AddCustomModelDialog = ({
           type: FormFieldType.Select,
           required: field.required,
           defaultValue,
-          disabled: field.disabled,
+          disabled: loading || field.disabled,
           options: field.options,
           placeholder: field.label,
         };
@@ -181,7 +181,7 @@ export const AddCustomModelDialog = ({
           type: FormFieldType.Custom,
           required: field.required,
           defaultValue,
-          disabled: field.disabled,
+          disabled: loading || field.disabled,
           schema: field.required
             ? z.array(z.string()).min(1, t('modelTypeRequired'))
             : z.array(z.string()).optional(),
@@ -192,6 +192,13 @@ export const AddCustomModelDialog = ({
                 {field.options?.map((opt, index) => {
                   const isChecked = currentValues.includes(opt.value);
                   const switchId = `${field.name}-${opt.value}`;
+                  const handleCheckedChange = (checked: boolean) => {
+                    if (loading || field.disabled) return;
+                    const next = checked
+                      ? [...currentValues, opt.value]
+                      : currentValues.filter((value) => value !== opt.value);
+                    fieldProps.onChange(next);
+                  };
                   return (
                     <div
                       key={opt.value}
@@ -208,14 +215,8 @@ export const AddCustomModelDialog = ({
                       <Switch
                         id={switchId}
                         checked={isChecked}
-                        disabled={field.disabled}
-                        onCheckedChange={(checked) => {
-                          if (field.disabled) return;
-                          const next = checked
-                            ? [...currentValues, opt.value]
-                            : currentValues.filter((v) => v !== opt.value);
-                          fieldProps.onChange(next);
-                        }}
+                        disabled={loading || field.disabled}
+                        onCheckedChange={handleCheckedChange}
                       />
                     </div>
                   );
@@ -238,7 +239,7 @@ export const AddCustomModelDialog = ({
         type: typeMap[field.type as 'text' | 'number' | 'multi-select'],
         required: field.required,
         defaultValue,
-        disabled: field.disabled,
+        disabled: loading || field.disabled,
         options: field.options,
         placeholder: field.label,
         ...(field.min !== undefined
@@ -265,7 +266,7 @@ export const AddCustomModelDialog = ({
           : {}),
       };
     });
-  }, [fields, t, existingNames]);
+  }, [fields, t, existingNames, loading]);
 
   const handleSubmit = useCallback(
     (values: FormValues) => {

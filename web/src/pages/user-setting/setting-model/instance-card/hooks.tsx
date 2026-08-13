@@ -14,17 +14,18 @@
  *  limitations under the License.
  */
 
-import { DynamicFormRef } from '@/components/dynamic-form';
+import type { DynamicFormRef } from '@/components/dynamic-form';
 import {
   useDeleteProviderInstance,
   useFetchAvailableProviders,
   useFetchProviderInstance,
   useVerifyProviderConnection,
 } from '@/hooks/use-llm-request';
-import { IProviderInstance } from '@/interfaces/database/llm';
-import { IModelInfo } from '@/interfaces/request/llm';
-import { RefObject, useCallback, useEffect, useMemo, useRef } from 'react';
+import type { IProviderInstance } from '@/interfaces/database/llm';
+import type { IModelInfo } from '@/interfaces/request/llm';
+import { type RefObject, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useProviderFields } from '../provider-schema/hooks';
+import { resolveRegionFromValues } from '../provider-schema/hooks/use-provider-modal-actions';
 import { SelectOption } from '../provider-schema/types';
 import {
   API_KEY_NESTED_FIELDS,
@@ -323,6 +324,7 @@ export function useVerifyProvider(
   providerName: string,
   formRef: RefObject<DynamicFormRef>,
   verifyTransform?: VerifyTransform,
+  baseUrlRegionMaps?: Record<string, Map<string, string>>,
 ) {
   const { verifyProviderConnection } = useVerifyProviderConnection();
 
@@ -350,6 +352,10 @@ export function useVerifyProvider(
           model_info: values.model_info,
         };
       }
+      const region = resolveRegionFromValues(values, baseUrlRegionMaps);
+      if (region !== undefined) {
+        verifyArgs.region = region;
+      }
       const ret = await verifyProviderConnection({
         provider_name: providerName,
         ...(verifyArgs as any),
@@ -365,7 +371,13 @@ export function useVerifyProvider(
         logs: string;
       };
     },
-    [providerName, formRef, verifyProviderConnection, verifyTransform],
+    [
+      baseUrlRegionMaps,
+      formRef,
+      providerName,
+      verifyProviderConnection,
+      verifyTransform,
+    ],
   );
 }
 
@@ -418,6 +430,8 @@ interface UseInstanceSaveStateArgs {
   instanceDetails: IProviderInstance | undefined;
   initialValues: Record<string, any>;
   modelInfoRef: { current: IModelInfo[] };
+  /** Whether the saved instance's model query has produced an authoritative snapshot. */
+  modelInfoLoaded?: boolean;
   /**
    * Optional provider-specific transform that maps form values to the
    * submit API body (e.g. OpenDataLoader's nested
@@ -426,6 +440,7 @@ interface UseInstanceSaveStateArgs {
    * used.
    */
   submitTransform?: (values: Record<string, any>) => Record<string, any>;
+  baseUrlRegionMaps?: Record<string, Map<string, string>>;
 }
 
 /**
@@ -437,16 +452,16 @@ interface UseInstanceSaveStateArgs {
  *   - `buildPayload()`: assemble the API body from current form values.
  *   - `getSavePayload()`: return the body if dirty (or a draft with a
  *     name), else `null` so the parent can skip the redundant call.
- *   - `markSaved()`: re-baseline after a successful save.
+ *   - `markSaved(payload)`: re-baseline from the acknowledged request.
  *   - `markModelsEdited()`: absorb a model PATCH into the baseline so
  *     the next top-save does not re-PUT the same model_info (the PATCH
  *     endpoint already persisted it).
  *
  * The dirty check compares a JSON signature of the current payload to
  * the baseline signature, mirroring the old `lastSavedPayloadRef`
- * approach. `model_info` is folded into the signature so editing a
- * nested credential field (e.g. MiniMax `group_id`, which is nested
- * inside `api_key` by `buildApiKeyValue`) still counts as dirty.
+ * approach. Both `model_info` and provider-specific credential fields
+ * (e.g. MiniMax `group_id`, nested inside `api_key`) are folded into the
+ * signature so either kind of edit counts as dirty.
  */
 export function useInstanceSaveState({
   formRef,
@@ -459,9 +474,12 @@ export function useInstanceSaveState({
   instanceDetails,
   initialValues,
   modelInfoRef,
+  modelInfoLoaded = true,
   submitTransform,
+  baseUrlRegionMaps,
 }: UseInstanceSaveStateArgs) {
   const baselinePayloadRef = useRef<string>('');
+  const baselineSeedSignatureRef = useRef<string>('');
   const draftNameRef = useRef(draftName);
   useEffect(() => {
     draftNameRef.current = draftName;
@@ -472,6 +490,84 @@ export function useInstanceSaveState({
   useEffect(() => {
     editedNameRef.current = editedInstanceName ?? instanceName;
   });
+
+  // Build the canonical API payload from explicit values. Both live form
+  // saves and remote baseline seeds use this path so provider-specific
+  // transforms cannot drift from dirty tracking.
+  const buildPayloadFromValues = useCallback(
+    (
+      values: Record<string, any>,
+      modelInfo: IModelInfo[] | undefined,
+      targetInstanceName: string,
+    ): Record<string, any> | null => {
+      const region =
+        resolveRegionFromValues(values, baseUrlRegionMaps) ?? values.region;
+      if (submitTransform) {
+        const transformed = submitTransform(
+          modelInfo === undefined
+            ? values
+            : { ...values, model_info: modelInfo },
+        ) as Record<string, any>;
+        if (modelInfo === undefined) {
+          delete transformed.model_info;
+        }
+        if (isDraft) {
+          if (!targetInstanceName) return null;
+          return {
+            ...transformed,
+            llm_factory: providerName,
+            instance_name: targetInstanceName,
+            region,
+            ...(modelInfo === undefined ? {} : { model_info: modelInfo }),
+          };
+        }
+        return {
+          ...transformed,
+          provider_name: providerName,
+          instance_name: targetInstanceName,
+          id: instanceDetails?.id || instanceId,
+          base_url: transformed.base_url ?? '',
+          region: region || 'default',
+          ...(modelInfo === undefined ? {} : { model_info: modelInfo }),
+          verify: false,
+        };
+      }
+
+      if (isDraft) {
+        if (!targetInstanceName) return null;
+        const payload: Record<string, any> = {
+          llm_factory: providerName,
+          instance_name: targetInstanceName,
+          api_key: buildApiKeyValue(values) ?? '',
+          base_url: values.base_url,
+          region,
+        };
+        if (modelInfo && modelInfo.length > 0) {
+          payload.model_info = modelInfo;
+        }
+        return payload;
+      }
+
+      return {
+        provider_name: providerName,
+        instance_name: targetInstanceName,
+        id: instanceDetails?.id || instanceId,
+        api_key: buildApiKeyValue(values) ?? '',
+        base_url: values.base_url,
+        region: region || 'default',
+        ...(modelInfo === undefined ? {} : { model_info: modelInfo }),
+        verify: false,
+      };
+    },
+    [
+      baseUrlRegionMaps,
+      instanceDetails?.id,
+      instanceId,
+      isDraft,
+      providerName,
+      submitTransform,
+    ],
+  );
 
   // Build the API payload from the current form values. For drafts the
   // body targets `addProviderInstance` (no `id`, `llm_factory` at the
@@ -486,81 +582,31 @@ export function useInstanceSaveState({
       any
     >;
     const modelInfo =
-      modelInfoRef.current.length > 0 ? modelInfoRef.current : [];
+      isDraft || modelInfoLoaded ? modelInfoRef.current : undefined;
 
-    // Provider-specific field mapping (e.g. OpenDataLoader's nested
-    // `opendataloader_apiserver` / `opendataloader_api_key`). The
-    // transform produces the canonical submit body shape
-    // (`instance_name`, `llm_factory`, `api_key`, `base_url`,
-    // `model_info`); we then layer on the card's own state (typed /
-    // edited name, model_info ref, update-only fields for saved cards).
-    if (submitTransform) {
-      const transformed = submitTransform({
-        ...values,
-        model_info: modelInfo,
-      }) as Record<string, any>;
-      if (isDraft) {
-        const trimmed = draftNameRef.current.trim();
-        if (!trimmed) return null;
-        return {
-          ...transformed,
-          llm_factory: providerName,
-          instance_name: trimmed,
-          model_info: modelInfo,
-        };
-      }
-      const resolvedId = instanceDetails?.id || instanceId;
-      return {
-        ...transformed,
-        provider_name: providerName,
-        instance_name: editedNameRef.current,
-        id: resolvedId,
-        base_url: transformed.base_url ?? '',
-        region: values.region || 'default',
-        model_info: modelInfo,
-        verify: false,
-      };
-    }
+    const targetInstanceName = isDraft
+      ? draftNameRef.current.trim()
+      : editedNameRef.current;
+    return buildPayloadFromValues(values, modelInfo, targetInstanceName);
+  }, [buildPayloadFromValues, formRef, isDraft, modelInfoLoaded, modelInfoRef]);
 
-    if (isDraft) {
-      const trimmed = draftNameRef.current.trim();
-      if (!trimmed) return null;
-      const payload: Record<string, any> = {
-        llm_factory: providerName,
-        instance_name: trimmed,
-        api_key: buildApiKeyValue(values) ?? '',
-        base_url: values.base_url,
-      };
-      if (modelInfoRef.current.length > 0) {
-        payload.model_info = modelInfoRef.current;
-      }
-      return payload;
-    }
-
-    const resolvedId = instanceDetails?.id || instanceId;
-    const apiKeyValue = buildApiKeyValue(values);
-    const payload: Record<string, any> = {
-      provider_name: providerName,
-      // Use the edited name (may differ from the persisted `instanceName`
-      // when the user has renamed the instance via double-click).
-      instance_name: editedNameRef.current,
-      id: resolvedId,
-      api_key: apiKeyValue ?? '',
-      base_url: values.base_url,
-      region: values.region || 'default',
-      model_info: modelInfoRef.current.length > 0 ? modelInfoRef.current : [],
-      verify: false,
-    };
-    return payload;
-  }, [
-    isDraft,
-    providerName,
-    instanceId,
-    instanceDetails?.id,
-    formRef,
-    modelInfoRef,
-    submitTransform,
-  ]);
+  const buildInstanceUpdatePayload = useCallback(
+    (modelInfo: IModelInfo[]): Record<string, any> | null => {
+      if (isDraft || !instanceDetails || !modelInfoLoaded) return null;
+      const values = (formRef.current?.getValues?.() ?? {}) as Record<
+        string,
+        any
+      >;
+      return buildPayloadFromValues(values, modelInfo, editedNameRef.current);
+    },
+    [
+      buildPayloadFromValues,
+      formRef,
+      instanceDetails,
+      isDraft,
+      modelInfoLoaded,
+    ],
+  );
 
   // Seed the "last saved" baseline once instance details (or the
   // draft's empty state) are available, so the first `getSavePayload()`
@@ -570,33 +616,40 @@ export function useInstanceSaveState({
   useEffect(() => {
     if (isDraft) {
       baselinePayloadRef.current = '';
+      baselineSeedSignatureRef.current = '';
       return;
     }
-    const resolvedId = instanceDetails?.id || instanceId;
-    if (!resolvedId) return;
-    const baseline = {
-      provider_name: providerName,
-      instance_name: instanceName,
-      id: resolvedId,
-      api_key: buildApiKeyValue(initialValues),
-      base_url: initialValues.base_url,
-      region: initialValues.region,
-      // model_info baseline is `[]`; `markModelsEdited` rewrites it after
-      // a model PATCH so the next top-save short-circuits. The first
-      // save after the models initially load may re-send the same
-      // model_info (idempotent) - acceptable, matches the old
-      // `lastSavedPayloadRef` seeding behaviour.
-      model_info: [] as IModelInfo[],
-      verify: false,
-    };
-    baselinePayloadRef.current = JSON.stringify(baseline);
+    if (!instanceDetails || !modelInfoLoaded) return;
+    const seedSignature = JSON.stringify({ instanceDetails, initialValues });
+    if (seedSignature === baselineSeedSignatureRef.current) return;
+    baselineSeedSignatureRef.current = seedSignature;
+    let persistedModelInfo: IModelInfo[] = modelInfoRef.current;
+    try {
+      const currentBaseline = JSON.parse(
+        baselinePayloadRef.current || '{}',
+      ) as Record<string, any>;
+      if (Array.isArray(currentBaseline.model_info)) {
+        persistedModelInfo = currentBaseline.model_info;
+      }
+    } catch {
+      // Replace malformed local state with the remote details seed below.
+    }
+    const baseline = buildPayloadFromValues(
+      initialValues,
+      persistedModelInfo,
+      instanceName,
+    );
+    if (baseline) {
+      baselinePayloadRef.current = JSON.stringify(baseline);
+    }
   }, [
     isDraft,
-    providerName,
     instanceName,
-    instanceId,
-    instanceDetails?.id,
+    instanceDetails,
     initialValues,
+    modelInfoLoaded,
+    modelInfoRef,
+    buildPayloadFromValues,
   ]);
 
   // `getSavePayload()` is the imperative entry point the parent calls
@@ -650,15 +703,15 @@ export function useInstanceSaveState({
     };
   }, [buildPayload, isDraft, instanceDetails]);
 
-  // After a successful save the parent calls `markSaved()` so the
-  // baseline catches up to the just-persisted values. Without this,
-  // the next `getSavePayload()` would re-fire the same PUT.
-  const markSaved = useCallback(() => {
-    const payload = buildPayload();
-    if (payload) {
-      baselinePayloadRef.current = JSON.stringify(payload);
-    }
-  }, [buildPayload]);
+  // The parent passes the exact request body acknowledged by the server.
+  // Reading the form here would incorrectly absorb edits made while the
+  // request was in flight into the persisted baseline.
+  const markSaved = useCallback(
+    (savedPayload: Readonly<Record<string, any>>) => {
+      baselinePayloadRef.current = JSON.stringify(savedPayload);
+    },
+    [],
+  );
 
   // Absorb a model patch into the baseline. `patchInstanceModel` has
   // already persisted the new max_tokens / model_type / features
@@ -672,23 +725,26 @@ export function useInstanceSaveState({
   //
   // Skipped for drafts (the baseline is empty there) and until the
   // baseline has been seeded.
-  const markModelsEdited = useCallback(() => {
-    if (isDraft) return;
-    const prev = baselinePayloadRef.current;
-    if (!prev) return;
-    try {
-      const parsed = JSON.parse(prev) as Record<string, any>;
-      parsed.model_info =
-        modelInfoRef.current.length > 0 ? modelInfoRef.current : [];
-      parsed.verify = false;
-      baselinePayloadRef.current = JSON.stringify(parsed);
-    } catch {
-      // ignore parse errors - baseline will be re-seeded on next details load
-    }
-  }, [isDraft, modelInfoRef]);
+  const markModelsEdited = useCallback(
+    (modelInfo: IModelInfo[]) => {
+      if (isDraft) return;
+      const prev = baselinePayloadRef.current;
+      if (!prev) return;
+      try {
+        const parsed = JSON.parse(prev) as Record<string, any>;
+        parsed.model_info = modelInfo;
+        parsed.verify = false;
+        baselinePayloadRef.current = JSON.stringify(parsed);
+      } catch {
+        // ignore parse errors - baseline will be re-seeded on next details load
+      }
+    },
+    [isDraft],
+  );
 
   return {
     buildPayload,
+    buildInstanceUpdatePayload,
     getSavePayload,
     markSaved,
     markModelsEdited,
@@ -712,7 +768,7 @@ export function useFormFields(
   baseUrlOptions: SelectOption[] | undefined,
   hideWhenInstanceExists: (values: any) => boolean,
 ) {
-  const { fields, defaultValues } = useProviderFields({
+  const { fields, defaultValues, baseUrlRegionMaps } = useProviderFields({
     llmFactory: providerName,
     // Always seed initial values (drafts need the default base_url;
     // saved cards need the persisted api_key / base_url).
@@ -740,7 +796,7 @@ export function useFormFields(
     // oxlint-disable-next-line react/exhaustive-deps
   }, [defaultValuesKey]);
 
-  return { formFields, formDefaultValues };
+  return { formFields, formDefaultValues, baseUrlRegionMaps };
 }
 
 // Re-export ApiKeyNestedField for components that need it.

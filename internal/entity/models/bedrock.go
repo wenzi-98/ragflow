@@ -25,7 +25,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,11 +56,9 @@ const (
 	bedrockStreamSuffixSuffix      = "-stream"
 )
 
-// Bedrock signing services and endpoint hostnames.
-//
-// The control plane (foundation-model catalog) and the runtime plane
-// (Converse / Converse-Stream) sit on different subdomains and sign
-// against different SigV4 service names.
+// Bedrock service names and endpoint hostnames. SigV4 modes sign the
+// control and runtime planes with different service names; API key mode
+// uses the same endpoints with Bearer authentication.
 const (
 	bedrockRuntimeService  = "bedrock-runtime"
 	bedrockControlService  = "bedrock"
@@ -63,13 +66,17 @@ const (
 	bedrockControlHostTmpl = "bedrock.%s.amazonaws.com"
 )
 
-// Bedrock authentication modes mirroring the Python LiteLLMBase
-// dispatch at rag/llm/chat_model.py:1872. The API key is stored as a
-// JSON blob containing one of these modes plus its required fields.
+// Bedrock authentication modes. The credential is stored as a JSON blob
+// containing one of these modes plus its required fields.
 const (
 	bedrockAuthAccessKey  = "access_key_secret"
 	bedrockAuthIAMRole    = "iam_role"
 	bedrockAuthAssumeRole = "assume_role"
+	bedrockAuthAPIKey     = "bedrock_api_key"
+
+	bedrockEndpointRuntime         = "runtime"
+	bedrockEndpointMantleOpenAI    = "mantle_openai"
+	bedrockEndpointMantleAnthropic = "mantle_anthropic"
 )
 
 // bedrockAssumeRoleSession identifies temporary sessions in CloudTrail
@@ -77,24 +84,10 @@ const (
 // implementation's RoleSessionName so audit logs stay consistent.
 const bedrockAssumeRoleSession = "BedrockSession"
 
-// BedrockModel implements ModelDriver for AWS Bedrock.
-//
-// Bedrock is AWS-signed (SigV4) rather than OpenAI-compatible, so this
-// driver differs from the SaaS cluster in three ways:
-//   - Authentication uses AWS SigV4 over an access key + secret (and
-//     optionally a session token), not a static Bearer token.
-//   - The "api key" is a JSON blob carrying auth_mode, region, and the
-//     mode-specific credential material (access_key_secret /
-//     iam_role / assume_role). This mirrors the Python implementation
-//     at rag/llm/chat_model.py:1872.
-//   - The streaming response uses the AWS event-stream binary framing
-//     (vnd.amazon.eventstream), not Server-Sent Events. Each frame is
-//     decoded with the aws-sdk-go-v2 eventstream package.
-//
-// The base URL is computed from the configured region rather than
-// supplied from conf/models/bedrock.json, because every Bedrock region
-// has its own endpoint and the URL is fully determined by the region
-// in the API key.
+// BedrockModel implements ModelDriver for AWS Bedrock. Runtime endpoints
+// support both SigV4 credentials and Bedrock API keys. Mantle endpoints
+// reuse the OpenAI- or Anthropic-compatible drivers with Bearer auth.
+// Runtime streaming uses AWS event-stream binary framing rather than SSE.
 type BedrockModel struct {
 	baseModel BaseModel
 }
@@ -128,13 +121,17 @@ func (b *BedrockModel) Name() string {
 // Every auth_mode has a different shape, so non-applicable fields
 // are simply left zero-valued; resolution time validates them.
 type bedrockKey struct {
-	AuthMode    string `json:"auth_mode"`
-	Region      string `json:"bedrock_region"`
-	AccessKey   string `json:"bedrock_ak"`
-	SecretKey   string `json:"bedrock_sk"`
-	AWSRoleARN  string `json:"aws_role_arn"`
-	ExternalID  string `json:"aws_external_id"`
-	SessionName string `json:"role_session_name"`
+	AuthMode             string `json:"auth_mode"`
+	Region               string `json:"bedrock_region"`
+	AccessKey            string `json:"bedrock_ak"`
+	SecretKey            string `json:"bedrock_sk"`
+	AWSRoleARN           string `json:"aws_role_arn"`
+	ExternalID           string `json:"aws_external_id"`
+	SessionName          string `json:"role_session_name"`
+	BedrockAPIKey        string `json:"bedrock_api_key"`
+	EndpointType         string `json:"bedrock_endpoint_type"`
+	EndpointURL          string `json:"bedrock_endpoint_url"`
+	DiscoveryEndpointURL string `json:"bedrock_discovery_endpoint_url"`
 }
 
 // parseBedrockKey decodes the JSON blob stored in APIConfig.ApiKey
@@ -165,10 +162,142 @@ func parseBedrockKey(raw string) (*bedrockKey, error) {
 	case bedrockAuthAssumeRole:
 		// Default credential chain handles its own validation when
 		// we ask config.LoadDefaultConfig to materialize credentials.
+	case bedrockAuthAPIKey:
+		key.BedrockAPIKey = strings.TrimSpace(key.BedrockAPIKey)
+		if key.BedrockAPIKey == "" {
+			return nil, fmt.Errorf("bedrock: bedrock_api_key mode requires bedrock_api_key")
+		}
 	default:
 		return nil, fmt.Errorf("bedrock: unsupported auth_mode %q", key.AuthMode)
 	}
+	endpointType, endpointURL, err := resolveBedrockEndpoint(key.AuthMode, key.EndpointType, key.EndpointURL)
+	if err != nil {
+		return nil, err
+	}
+	key.EndpointType = endpointType
+	key.EndpointURL = endpointURL
+	if key.EndpointType == bedrockEndpointRuntime {
+		key.DiscoveryEndpointURL = normalizeBedrockEndpoint(bedrockEndpointRuntime, key.DiscoveryEndpointURL)
+		if err := validateBedrockEndpointTarget(key.DiscoveryEndpointURL); err != nil {
+			return nil, err
+		}
+	} else {
+		key.DiscoveryEndpointURL = ""
+	}
 	return &key, nil
+}
+
+var awsBedrockHostPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`^bedrock(?:-runtime)?(?:-fips)?\.[a-z0-9-]+\.(?:amazonaws\.com(?:\.cn)?|api\.aws|api\.amazonwebservices\.com\.cn)$`),
+	regexp.MustCompile(`^bedrock-mantle\.[a-z0-9-]+\.api\.aws$`),
+	regexp.MustCompile(`^vpce-[a-z0-9-]+\.bedrock(?:-mantle|-fips|-runtime(?:-fips)?)?\.[a-z0-9-]+\.vpce\.amazonaws\.com(?:\.cn)?$`),
+}
+
+var awsBedrockRegionPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func resolveBedrockEndpoint(authMode, endpointType, endpointURL string) (string, string, error) {
+	if endpointType == "" {
+		endpointType = bedrockEndpointRuntime
+	}
+	if endpointType != bedrockEndpointRuntime && endpointType != bedrockEndpointMantleOpenAI && endpointType != bedrockEndpointMantleAnthropic {
+		return "", "", fmt.Errorf("bedrock: unsupported endpoint type %q", endpointType)
+	}
+	endpointURL = normalizeBedrockEndpoint(endpointType, endpointURL)
+	if endpointType != bedrockEndpointRuntime && endpointURL == "" {
+		return "", "", fmt.Errorf("bedrock: endpoint URL is required for a Mantle endpoint")
+	}
+	if authMode != bedrockAuthAPIKey && endpointType != bedrockEndpointRuntime {
+		return "", "", fmt.Errorf("bedrock: Mantle endpoints require Bedrock API key authentication")
+	}
+	if err := validateBedrockEndpointTarget(endpointURL); err != nil {
+		return "", "", err
+	}
+	return endpointType, endpointURL, nil
+}
+
+func normalizeBedrockEndpoint(endpointType, endpointURL string) string {
+	endpointURL = strings.TrimRight(strings.TrimSpace(endpointURL), "/")
+	if endpointURL == "" || endpointType == bedrockEndpointRuntime {
+		return endpointURL
+	}
+	for _, suffix := range []string{"/anthropic/v1/messages", "/v1/models", "/anthropic", "/v1"} {
+		if strings.HasSuffix(endpointURL, suffix) {
+			endpointURL = strings.TrimSuffix(endpointURL, suffix)
+			break
+		}
+	}
+	if endpointType == bedrockEndpointMantleOpenAI {
+		return endpointURL + "/v1"
+	}
+	return endpointURL + "/anthropic"
+}
+
+func mantleCatalogURL(endpointURL string) string {
+	root := normalizeBedrockEndpoint(bedrockEndpointMantleOpenAI, endpointURL)
+	return root
+}
+
+func validateBedrockEndpointTarget(endpointURL string) error {
+	if endpointURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(endpointURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+		return fmt.Errorf("bedrock: endpoint URL must be a valid HTTPS URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("bedrock: endpoint URL must not contain credentials, a query, or a fragment")
+	}
+	port := parsed.Port()
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	for _, pattern := range awsBedrockHostPatterns {
+		if pattern.MatchString(host) {
+			if port != "" && port != "443" {
+				return fmt.Errorf("bedrock: endpoint URL must not specify a non-default port")
+			}
+			return nil
+		}
+	}
+	for _, allowed := range strings.Split(os.Getenv("BEDROCK_ENDPOINT_HOST_ALLOWLIST"), ",") {
+		allowedHost, allowedPort := parseBedrockEndpointAllowlistEntry(allowed)
+		if !matchesBedrockEndpointHost(host, allowedHost) {
+			continue
+		}
+		if (allowedPort == "" && (port == "" || port == "443")) || allowedPort == port {
+			return nil
+		}
+	}
+	if port != "" && port != "443" {
+		return fmt.Errorf("bedrock: endpoint URL non-default port requires an exact host:port entry in BEDROCK_ENDPOINT_HOST_ALLOWLIST")
+	}
+	return fmt.Errorf("bedrock: endpoint hostname is not allowed; configure BEDROCK_ENDPOINT_HOST_ALLOWLIST for a trusted proxy")
+}
+
+func parseBedrockEndpointAllowlistEntry(entry string) (string, string) {
+	entry = strings.ToLower(strings.TrimSpace(entry))
+	host, port, err := net.SplitHostPort(entry)
+	if err == nil {
+		return strings.TrimSuffix(host, "."), port
+	}
+	return strings.TrimSuffix(entry, "."), ""
+}
+
+func matchesBedrockEndpointHost(host, allowedHost string) bool {
+	return allowedHost == host || (strings.HasPrefix(allowedHost, "*.") && host != strings.TrimPrefix(allowedHost, "*.") && strings.HasSuffix(host, strings.TrimPrefix(allowedHost, "*")))
+}
+
+func validateBedrockRequestTarget(requestURL *url.URL, service string) error {
+	if requestURL.RawQuery == "" {
+		return validateBedrockEndpointTarget(requestURL.String())
+	}
+	query := requestURL.Query()
+	inferenceTypes := query["byInferenceType"]
+	if service != bedrockControlService || len(query) != 1 || len(inferenceTypes) != 1 || inferenceTypes[0] != "ON_DEMAND" {
+		return fmt.Errorf("bedrock: request URL contains an unsupported query")
+	}
+	baseURL := *requestURL
+	baseURL.RawQuery = ""
+	return validateBedrockEndpointTarget(baseURL.String())
 }
 
 // resolveRegion picks the region to use for both endpoint selection
@@ -176,13 +305,19 @@ func parseBedrockKey(raw string) (*bedrockKey, error) {
 // the same instance to a different region), falling back to the
 // region declared inside the API key JSON.
 func resolveBedrockRegion(apiConfig *APIConfig, key *bedrockKey) (string, error) {
+	var region string
 	if apiConfig != nil && apiConfig.Region != nil && *apiConfig.Region != "" {
-		return *apiConfig.Region, nil
+		region = *apiConfig.Region
+	} else {
+		region = key.Region
 	}
-	if key.Region == "" {
+	if region == "" {
 		return "", fmt.Errorf("bedrock: region is required (set apiConfig.Region or bedrock_region in the API key)")
 	}
-	return key.Region, nil
+	if !awsBedrockRegionPattern.MatchString(region) {
+		return "", fmt.Errorf("bedrock: region must be a valid AWS region identifier")
+	}
+	return region, nil
 }
 
 // resolveBedrockCredentials returns AWS credentials for the chosen
@@ -518,9 +653,8 @@ func mapChatConfigToInference(cfg *ChatConfig) *bedrockInferenceConfig {
 }
 
 // stringContent normalises Message.Content (interface{}) into a single
-// string. Multimodal content arrays are rejected here because this PR
-// only ships the text-only chat path; image/document blocks will be
-// added in a follow-on along with vision Bedrock model routing.
+// string. Multimodal content arrays are rejected because BedrockModel
+// currently implements text-only chat.
 func stringContent(content interface{}) (string, error) {
 	switch v := content.(type) {
 	case nil:
@@ -562,6 +696,42 @@ func signBedrockRequest(ctx context.Context, req *http.Request, body []byte, cre
 	return nil
 }
 
+func authorizeBedrockRequest(ctx context.Context, req *http.Request, body []byte, key *bedrockKey, service, region string) error {
+	if key.AuthMode == bedrockAuthAPIKey {
+		if err := validateBedrockRequestTarget(req.URL, service); err != nil {
+			return fmt.Errorf("bedrock: refusing to send API key to an untrusted endpoint: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key.BedrockAPIKey)
+		return nil
+	}
+	creds, err := resolveBedrockCredentials(ctx, key, region)
+	if err != nil {
+		return err
+	}
+	return signBedrockRequest(ctx, req, body, creds, service, region)
+}
+
+func (b *BedrockModel) mantleOpenAI(key *bedrockKey) *OpenAIModel {
+	return newOpenAIModel(
+		map[string]string{"default": key.EndpointURL},
+		URLSuffix{Chat: "chat/completions", Models: "models"},
+		b.baseModel.httpClient,
+	)
+}
+
+func (b *BedrockModel) mantleAnthropic(key *bedrockKey) *AnthropicModel {
+	return newAnthropicModel(
+		map[string]string{"default": key.EndpointURL},
+		URLSuffix{Chat: "v1/messages", Models: "v1/models"},
+		b.baseModel.httpClient,
+	)
+}
+
+func mantleAPIConfig(key *bedrockKey) *APIConfig {
+	region := "default"
+	return &APIConfig{ApiKey: &key.BedrockAPIKey, Region: &region}
+}
+
 // ChatWithMessages sends a non-streaming Converse request and returns
 // the joined assistant answer. ReasonContent is always non-nil per the
 // driver contract; Bedrock surfaces no reasoning channel today, so it
@@ -582,6 +752,12 @@ func (b *BedrockModel) ChatWithMessages(ctx context.Context, modelName string, m
 	if err != nil {
 		return nil, err
 	}
+	if key.EndpointType == bedrockEndpointMantleOpenAI {
+		return b.mantleOpenAI(key).ChatWithMessages(ctx, modelName, messages, mantleAPIConfig(key), chatModelConfig, modelUsage)
+	}
+	if key.EndpointType == bedrockEndpointMantleAnthropic {
+		return b.mantleAnthropic(key).ChatWithMessages(ctx, modelName, messages, mantleAPIConfig(key), chatModelConfig, modelUsage)
+	}
 
 	body, err := buildConverseRequest(messages, chatModelConfig)
 	if err != nil {
@@ -595,19 +771,17 @@ func (b *BedrockModel) ChatWithMessages(ctx context.Context, modelName string, m
 	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
 	defer cancel()
 
-	creds, err := resolveBedrockCredentials(ctx, key, region)
-	if err != nil {
-		return nil, err
-	}
-
 	url := b.bedrockRuntimeURL(region, modelName, b.chatSuffix())
+	if key.EndpointURL != "" {
+		url = joinBedrockPath(key.EndpointURL, "model", modelName, b.chatSuffix())
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("bedrock: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if err := signBedrockRequest(ctx, req, raw, creds, bedrockRuntimeService, region); err != nil {
+	if err := authorizeBedrockRequest(ctx, req, raw, key, bedrockRuntimeService, region); err != nil {
 		return nil, err
 	}
 
@@ -676,6 +850,12 @@ func (b *BedrockModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	if err != nil {
 		return err
 	}
+	if key.EndpointType == bedrockEndpointMantleOpenAI {
+		return b.mantleOpenAI(key).ChatStreamlyWithSender(ctx, modelName, messages, mantleAPIConfig(key), chatModelConfig, modelUsage, sender)
+	}
+	if key.EndpointType == bedrockEndpointMantleAnthropic {
+		return b.mantleAnthropic(key).ChatStreamlyWithSender(ctx, modelName, messages, mantleAPIConfig(key), chatModelConfig, modelUsage, sender)
+	}
 
 	body, err := buildConverseRequest(messages, chatModelConfig)
 	if err != nil {
@@ -689,19 +869,17 @@ func (b *BedrockModel) ChatStreamlyWithSender(ctx context.Context, modelName str
 	// Background context: event streams are long-lived so we attach
 	// no overall deadline. ResponseHeaderTimeout (set in the
 	// constructor) still caps connection setup.
-	creds, err := resolveBedrockCredentials(ctx, key, region)
-	if err != nil {
-		return err
-	}
-
 	url := b.bedrockRuntimeURL(region, modelName, b.streamSuffix())
+	if key.EndpointURL != "" {
+		url = joinBedrockPath(key.EndpointURL, "model", modelName, b.streamSuffix())
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("bedrock: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/vnd.amazon.eventstream")
-	if err := signBedrockRequest(ctx, req, raw, creds, bedrockRuntimeService, region); err != nil {
+	if err := authorizeBedrockRequest(ctx, req, raw, key, bedrockRuntimeService, region); err != nil {
 		return err
 	}
 
@@ -852,13 +1030,17 @@ func extractBedrockDeltaText(payload []byte) (string, error) {
 	return env.Delta.Text, nil
 }
 
-// bedrockListModelsResponse mirrors the relevant subset of the
-// control-plane response shape. The full record carries provider,
-// modality, lifecycle status, etc., which we deliberately drop to
-// match the ModelDriver.ListModels return type ([]string).
+// bedrockListModelsResponse mirrors the control-plane fields needed to
+// identify active models that can be invoked on demand by model ID.
 type bedrockListModelsResponse struct {
 	ModelSummaries []struct {
-		ModelID string `json:"modelId"`
+		ModelID                 string   `json:"modelId"`
+		InputModalities         []string `json:"inputModalities"`
+		OutputModalities        []string `json:"outputModalities"`
+		InferenceTypesSupported []string `json:"inferenceTypesSupported"`
+		ModelLifecycle          struct {
+			Status string `json:"status"`
+		} `json:"modelLifecycle"`
 	} `json:"modelSummaries"`
 }
 
@@ -879,22 +1061,47 @@ func (b *BedrockModel) ListModels(ctx context.Context, apiConfig *APIConfig) ([]
 	if err != nil {
 		return nil, err
 	}
+	if key.EndpointType != bedrockEndpointRuntime {
+		catalogKey := *key
+		catalogKey.EndpointURL = mantleCatalogURL(key.EndpointURL)
+		models, listErr := b.mantleOpenAI(&catalogKey).ListModels(ctx, mantleAPIConfig(key))
+		if listErr != nil {
+			return nil, listErr
+		}
+		filtered := make([]ListModelResponse, 0, len(models))
+		for _, model := range models {
+			if model.Name == "" {
+				continue
+			}
+			// Mantle's model catalog proves availability, not compatibility
+			// with a specific invocation API. Keep the candidate visible but
+			// require the caller to select and verify its capability.
+			model.ModelTypes = []string{}
+			filtered = append(filtered, model)
+		}
+		return filtered, nil
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
 	defer cancel()
 
-	creds, err := resolveBedrockCredentials(ctx, key, region)
-	if err != nil {
-		return nil, err
+	endpointURL := b.bedrockControlURL(region, b.modelsSuffix())
+	if key.DiscoveryEndpointURL != "" {
+		endpointURL = joinBedrockPath(key.DiscoveryEndpointURL, b.modelsSuffix())
 	}
-
-	url := b.bedrockControlURL(region, b.modelsSuffix())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	parsedURL, err := url.Parse(endpointURL)
+	if err != nil {
+		return nil, fmt.Errorf("bedrock: parse model catalog URL: %w", err)
+	}
+	query := parsedURL.Query()
+	query.Set("byInferenceType", "ON_DEMAND")
+	parsedURL.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("bedrock: build request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	if err = signBedrockRequest(ctx, req, nil, creds, bedrockControlService, region); err != nil {
+	if err = authorizeBedrockRequest(ctx, req, nil, key, bedrockControlService, region); err != nil {
 		return nil, err
 	}
 
@@ -925,19 +1132,48 @@ func (b *BedrockModel) ListModels(ctx context.Context, apiConfig *APIConfig) ([]
 		if m.ModelID == "" {
 			continue
 		}
-		models = append(models, ListModelResponse{
-			Name: m.ModelID,
-		})
+		if len(m.InferenceTypesSupported) > 0 && !slices.Contains(m.InferenceTypesSupported, "ON_DEMAND") {
+			continue
+		}
+		if m.ModelLifecycle.Status != "" && m.ModelLifecycle.Status != "ACTIVE" {
+			continue
+		}
+		modelTypes := bedrockModelTypes(m.ModelID, m.InputModalities, m.OutputModalities)
+		if len(modelTypes) == 0 {
+			continue
+		}
+		models = append(models, ListModelResponse{Name: m.ModelID, ModelTypes: modelTypes})
 	}
 	return models, nil
+}
+
+func bedrockModelTypes(modelID string, inputModalities, outputModalities []string) []string {
+	if !slices.Contains(inputModalities, "TEXT") || strings.Contains(strings.ToLower(modelID), "rerank") {
+		return nil
+	}
+	if slices.Contains(outputModalities, "EMBEDDING") && (strings.HasPrefix(modelID, "amazon.titan-embed-text") || strings.HasPrefix(modelID, "cohere.embed-")) {
+		return []string{"embedding"}
+	}
+	if slices.Contains(outputModalities, "TEXT") {
+		// Keep the advertised capabilities aligned with this driver's
+		// text-only chat implementation, even when the remote model accepts images.
+		return []string{"chat"}
+	}
+	return nil
 }
 
 // CheckConnection delegates to ListModels: a successful catalog query
 // proves credentials, region, and network reachability in one round
 // trip without burning a chat completion.
 func (b *BedrockModel) CheckConnection(ctx context.Context, apiConfig *APIConfig) error {
-	_, err := b.ListModels(ctx, apiConfig)
-	return err
+	models, err := b.ListModels(ctx, apiConfig)
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 {
+		return errors.New("no Bedrock models were discovered")
+	}
+	return nil
 }
 
 type bedrockTitanEmbeddingRequest struct {
@@ -987,33 +1223,35 @@ func (b *BedrockModel) Embed(ctx context.Context, modelName *string, texts []str
 	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
 	defer cancel()
 
-	creds, err := resolveBedrockCredentials(ctx, key, region)
-	if err != nil {
-		return nil, err
+	if key.EndpointType != bedrockEndpointRuntime {
+		return nil, fmt.Errorf("bedrock: Mantle endpoints do not support embeddings")
 	}
 
 	if strings.HasPrefix(modelID, "amazon.titan-embed-text-") {
-		return b.embedTitan(ctx, modelID, texts, region, creds, embeddingConfig, modelUsage)
+		return b.embedTitan(ctx, modelID, texts, region, key, embeddingConfig, modelUsage)
 	}
 	if strings.HasPrefix(modelID, "cohere.embed-") {
-		return b.embedCohere(ctx, modelID, texts, region, creds, embeddingConfig, modelUsage)
+		return b.embedCohere(ctx, modelID, texts, region, key, embeddingConfig, modelUsage)
 	}
 	return nil, fmt.Errorf("bedrock: unsupported embedding model %q", modelID)
 }
 
-func (b *BedrockModel) invokeEmbeddingModel(ctx context.Context, modelID string, body interface{}, region string, creds awssdk.Credentials) ([]byte, error) {
+func (b *BedrockModel) invokeEmbeddingModel(ctx context.Context, modelID string, body interface{}, region string, key *bedrockKey) ([]byte, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("bedrock: marshal embedding request: %w", err)
 	}
 	url := b.bedrockRuntimeURL(region, modelID, b.embeddingSuffix())
+	if key.EndpointURL != "" {
+		url = joinBedrockPath(key.EndpointURL, "model", modelID, b.embeddingSuffix())
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("bedrock: build embedding request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if err := signBedrockRequest(ctx, req, raw, creds, bedrockRuntimeService, region); err != nil {
+	if err := authorizeBedrockRequest(ctx, req, raw, key, bedrockRuntimeService, region); err != nil {
 		return nil, err
 	}
 
@@ -1037,7 +1275,7 @@ func (b *BedrockModel) invokeEmbeddingModel(ctx context.Context, modelID string,
 	return respBody, nil
 }
 
-func (b *BedrockModel) embedTitan(ctx context.Context, modelID string, texts []string, region string, creds awssdk.Credentials, embeddingConfig *EmbeddingConfig, modelUsage *common.ModelUsage) ([]EmbeddingData, error) {
+func (b *BedrockModel) embedTitan(ctx context.Context, modelID string, texts []string, region string, key *bedrockKey, embeddingConfig *EmbeddingConfig, modelUsage *common.ModelUsage) ([]EmbeddingData, error) {
 	embeddings := make([]EmbeddingData, 0, len(texts))
 	for i, text := range texts {
 		req := bedrockTitanEmbeddingRequest{
@@ -1046,7 +1284,7 @@ func (b *BedrockModel) embedTitan(ctx context.Context, modelID string, texts []s
 		if embeddingConfig != nil && embeddingConfig.Dimension > 0 && strings.HasPrefix(modelID, "amazon.titan-embed-text-v2") {
 			req.Dimensions = &embeddingConfig.Dimension
 		}
-		respBody, err := b.invokeEmbeddingModel(ctx, modelID, req, region, creds)
+		respBody, err := b.invokeEmbeddingModel(ctx, modelID, req, region, key)
 		if err != nil {
 			return nil, err
 		}
@@ -1065,7 +1303,7 @@ func (b *BedrockModel) embedTitan(ctx context.Context, modelID string, texts []s
 	return embeddings, nil
 }
 
-func (b *BedrockModel) embedCohere(ctx context.Context, modelID string, texts []string, region string, creds awssdk.Credentials, embeddingConfig *EmbeddingConfig, modelUsage *common.ModelUsage) ([]EmbeddingData, error) {
+func (b *BedrockModel) embedCohere(ctx context.Context, modelID string, texts []string, region string, key *bedrockKey, embeddingConfig *EmbeddingConfig, modelUsage *common.ModelUsage) ([]EmbeddingData, error) {
 	req := bedrockCohereEmbeddingRequest{
 		Texts:     texts,
 		InputType: "search_document",
@@ -1073,7 +1311,7 @@ func (b *BedrockModel) embedCohere(ctx context.Context, modelID string, texts []
 	if embeddingConfig != nil && embeddingConfig.Dimension > 0 && strings.HasPrefix(modelID, "cohere.embed-v4") {
 		req.OutputDimension = &embeddingConfig.Dimension
 	}
-	respBody, err := b.invokeEmbeddingModel(ctx, modelID, req, region, creds)
+	respBody, err := b.invokeEmbeddingModel(ctx, modelID, req, region, key)
 	if err != nil {
 		return nil, err
 	}

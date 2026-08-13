@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -14,8 +15,176 @@ import (
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
+	modelModule "ragflow/internal/entity/models"
 	"ragflow/internal/service"
 )
+
+func TestListProviderModelsRequestAcceptsStringAPIKeyAndExtensions(t *testing.T) {
+	var request listProviderModelsRequest
+	err := json.Unmarshal([]byte(`{"api_key":"token","extensions":{"endpoint_type":"runtime"}}`), &request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.APIKey != "token" || request.Extensions["endpoint_type"] != "runtime" {
+		t.Fatalf("request=%+v", request)
+	}
+}
+
+func TestProviderInstanceRequestsPreserveFieldPresence(t *testing.T) {
+	var complete CreateProviderInstanceRequest
+	if err := json.Unmarshal([]byte(`{"instance_name":"empty","api_key":"","base_url":"","region":"","model_info":[]}`), &complete); err != nil {
+		t.Fatal(err)
+	}
+	if complete.APIKey == nil || complete.BaseURL == nil || complete.Region == nil || complete.ModelInfo == nil {
+		t.Fatalf("explicit empty fields lost presence: %+v", complete)
+	}
+	if complete.isNameOnly() {
+		t.Fatal("explicit empty complete request was classified as name-only")
+	}
+
+	var nameOnly CreateProviderInstanceRequest
+	if err := json.Unmarshal([]byte(`{"instance_name":"name-only"}`), &nameOnly); err != nil {
+		t.Fatal(err)
+	}
+	if nameOnly.APIKey != nil || nameOnly.BaseURL != nil || nameOnly.Region != nil || nameOnly.ModelInfo != nil {
+		t.Fatalf("omitted fields unexpectedly present: %+v", nameOnly)
+	}
+	if !nameOnly.isNameOnly() {
+		t.Fatal("exact instance_name request was not classified as name-only")
+	}
+
+	var explicitNull CreateProviderInstanceRequest
+	if err := json.Unmarshal([]byte(`{"instance_name":"null-api-key","api_key":null}`), &explicitNull); err != nil {
+		t.Fatal(err)
+	}
+	if explicitNull.isNameOnly() {
+		t.Fatal("explicit null field was classified as omitted")
+	}
+
+	var alter AlterProviderInstanceRequest
+	if err := json.Unmarshal([]byte(`{"verify":false}`), &alter); err != nil {
+		t.Fatal(err)
+	}
+	if alter.InstanceName != nil || alter.APIKey != nil || alter.BaseURL != nil || alter.ModelInfo != nil {
+		t.Fatalf("omitted alter fields unexpectedly present: %+v", alter)
+	}
+	if !alter.hasField("verify") || alter.hasField("api_key") {
+		t.Fatalf("alter field presence was not preserved: %+v", alter.rawFields)
+	}
+	if region := alter.regionValue(); region != "" {
+		t.Fatalf("omitted region = %q, want empty Bedrock credential fallback", region)
+	}
+
+	var explicitRegion AlterProviderInstanceRequest
+	if err := json.Unmarshal([]byte(`{"region":"  ap-northeast-1  "}`), &explicitRegion); err != nil {
+		t.Fatal(err)
+	}
+	if region := explicitRegion.regionValue(); region != "  ap-northeast-1  " {
+		t.Fatalf("explicit region = %q", region)
+	}
+}
+
+func TestAlterProviderInstanceRejectsNullModelInfo(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{
+		{Key: "provider_id_or_name", Value: "Bedrock"},
+		{Key: "instance_id_or_name", Value: "instance"},
+	}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/providers/Bedrock/instances/instance",
+		bytes.NewBufferString(`{"instance_name":"instance","api_key":"","base_url":"","model_info":null,"verify":false}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	(&ProviderHandler{}).AlterProviderInstance(ctx)
+
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "model_info must be an array") {
+		t.Fatalf("response = %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestListProviderModelsRequestRejectsObjectAPIKey(t *testing.T) {
+	var request listProviderModelsRequest
+	if err := json.Unmarshal([]byte(`{"api_key":{"api_key":"token"}}`), &request); err == nil {
+		t.Fatal("object api_key was accepted")
+	}
+}
+
+func TestIsBedrockAPIKeyConfig(t *testing.T) {
+	for _, providerName := range []string{"Bedrock", "bedrock", "BEDROCK"} {
+		if !isBedrockAPIKeyConfig(providerName, `{"auth_mode":"bedrock_api_key","bedrock_api_key":"token"}`) {
+			t.Fatalf("%s API key mode was not detected", providerName)
+		}
+	}
+	if isBedrockAPIKeyConfig("Bedrock", `{"auth_mode":"access_key_secret"}`) {
+		t.Fatal("SigV4 mode was misclassified as API key mode")
+	}
+}
+
+func TestShouldListRemoteModelsKeepsDefaultEndpointBedrockOnly(t *testing.T) {
+	if shouldListRemoteModels("token", "", false) {
+		t.Fatal("non-Bedrock provider without base URL triggered remote discovery")
+	}
+	if !shouldListRemoteModels("token", "https://example.com", false) {
+		t.Fatal("provider with API key and base URL did not trigger remote discovery")
+	}
+	if !shouldListRemoteModels("token", "", true) {
+		t.Fatal("Bedrock API key did not use the default endpoint")
+	}
+}
+
+func TestProviderListModelItemUsesFrontendContract(t *testing.T) {
+	item := providerListModelItem(modelModule.ListModelResponse{Name: "model", ModelTypes: []string{"chat"}})
+	if item["max_tokens"] != 8192 {
+		t.Fatalf("max_tokens=%v, want 8192", item["max_tokens"])
+	}
+	if _, exists := item["max_output"]; exists {
+		t.Fatal("legacy max_output field must not be emitted")
+	}
+	emptyTypes := providerListModelItem(modelModule.ListModelResponse{Name: "empty"})["model_types"]
+	modelTypes, ok := emptyTypes.([]string)
+	if !ok || len(modelTypes) != 0 {
+		t.Fatalf("model_types=%#v, want an empty string array", emptyTypes)
+	}
+}
+
+func TestBuildModelListAPIKeyMapsBedrockExtensions(t *testing.T) {
+	for _, providerName := range []string{"Bedrock", "bedrock", "BEDROCK"} {
+		t.Run(providerName, func(t *testing.T) {
+			got, err := buildModelListAPIKey(providerName, "token", "ap-northeast-1", map[string]interface{}{
+				"auth_mode":              "bedrock_api_key",
+				"endpoint_type":          "runtime",
+				"discovery_endpoint_url": "https://bedrock.ap-northeast-1.amazonaws.com",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var key map[string]interface{}
+			if err = json.Unmarshal([]byte(got), &key); err != nil {
+				t.Fatal(err)
+			}
+			if key["bedrock_api_key"] != "token" || key["bedrock_region"] != "ap-northeast-1" || key["bedrock_endpoint_type"] != "runtime" {
+				t.Fatalf("key=%+v", key)
+			}
+			if key["bedrock_discovery_endpoint_url"] != "https://bedrock.ap-northeast-1.amazonaws.com" {
+				t.Fatalf("key=%+v", key)
+			}
+		})
+	}
+}
+
+func TestBuildModelListAPIKeyLeavesOtherProvidersUnchanged(t *testing.T) {
+	got, err := buildModelListAPIKey("OpenAI", "token", "", map[string]interface{}{"endpoint_type": "runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "token" {
+		t.Fatalf("api key=%q, want token", got)
+	}
+}
 
 func setupProviderHandlerTestDB(t *testing.T) *gorm.DB {
 	t.Helper()

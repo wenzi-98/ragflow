@@ -16,6 +16,7 @@
 import json
 import logging
 import aiohttp
+import asyncio
 from abc import ABC
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -60,6 +61,20 @@ class Base(ABC):
         if not raw_model_list:
             return []
         return self._format_model_list(raw_model_list)
+
+
+class Bedrock(Base):
+    _FACTORY_NAME = "Bedrock"
+
+    async def get_model_list(self):
+        from rag.llm.bedrock_model_discovery import discover_bedrock_models
+        from rag.utils.bedrock_endpoint import parse_bedrock_credentials
+
+        config = parse_bedrock_credentials(self.api_key)
+        if config.get("auth_mode") != "bedrock_api_key":
+            logging.debug("Skipping Bedrock model discovery for auth_mode=%s", config.get("auth_mode"))
+            return []
+        return await asyncio.to_thread(discover_bedrock_models, config)
 
 
 class VolcEngine(Base):

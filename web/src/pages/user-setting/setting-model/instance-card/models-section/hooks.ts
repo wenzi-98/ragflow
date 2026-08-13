@@ -51,6 +51,9 @@ const TOOL_FEATURE_KEYS = ['is_tools', 'tool_call', 'tools', 'function_call'];
 /** Sentinel instance name used by draft (unsaved) provider cards. */
 export const DRAFT_INSTANCE_SENTINEL = '__draft__';
 
+/** Debounce Bedrock discovery until multi-field credentials settle. */
+const BEDROCK_CATALOG_AUTO_FETCH_DEBOUNCE_MS = 500;
+
 // ---------------------------------------------------------------------------
 // Pure helpers (no React state, easy to test)
 // ---------------------------------------------------------------------------
@@ -72,6 +75,9 @@ export const hasToolFeature = (
 export const normalizeModelTypes = (raw: unknown): string[] =>
   Array.isArray(raw) ? raw : raw ? [raw as string] : [];
 
+export const hasKnownModelTypes = (model: IProviderModelItem): boolean =>
+  Array.isArray(model.model_types) && model.model_types.length > 0;
+
 /**
  * Build an `IModelInfo[]` (the shape the PUT
  * `/providers/{name}/instances/{name}` endpoint expects) from a list of
@@ -91,7 +97,29 @@ export const buildModelInfo = (items: IProviderModelItem[]): IModelInfo[] =>
  *  field (e.g. VolcEngine, Google Cloud) so the auto-fetch gate can
  *  distinguish "no base_url field" from "base_url field exists but is
  *  empty". */
-export type ResolvedCreds = { apiKey: string; baseUrl: string | undefined };
+export type ResolvedCreds = {
+  apiKey: string;
+  baseUrl: string | undefined;
+  region: string;
+  extensions: Record<string, unknown>;
+};
+
+export const areCatalogCredentialsReady = (
+  providerName: string,
+  apiKeyValue: string,
+  regionValue = '',
+  authMode?: unknown,
+): boolean => {
+  if (providerName === LLMFactory.VolcEngine) return !!apiKeyValue;
+  if (providerName !== LLMFactory.Bedrock) return true;
+  return authMode !== 'bedrock_api_key' || (!!apiKeyValue && !!regionValue);
+};
+
+export const isCatalogBaseURLReady = (
+  providerName: string,
+  baseUrl: string | undefined,
+): boolean =>
+  providerName === LLMFactory.Bedrock || baseUrl === undefined || !!baseUrl;
 
 // ---------------------------------------------------------------------------
 // 1. useResolveCreds — resolve api_key / base_url from host form or instance
@@ -109,6 +137,8 @@ export function useResolveCreds(
     return {
       apiKey: (fv.api_key as string) ?? instance?.api_key ?? '',
       baseUrl: (fv.base_url as string) ?? instance?.base_url,
+      region: (fv.region as string) ?? instance?.region ?? '',
+      extensions: (fv.extensions as Record<string, unknown> | undefined) ?? {},
     };
   }, [getFormValues, instance]);
 
@@ -127,10 +157,10 @@ interface UseModelsCatalogArgs {
   instanceModels: IInstanceModel[] | undefined;
 
   apiKeyValue: string;
-
   baseUrlValue: string | undefined;
-
   instanceDetailsLoaded?: boolean;
+  regionValue: string;
+  authMode?: unknown;
 }
 
 export function useModelsCatalog({
@@ -142,6 +172,8 @@ export function useModelsCatalog({
   apiKeyValue,
   baseUrlValue,
   instanceDetailsLoaded,
+  regionValue,
+  authMode,
 }: UseModelsCatalogArgs) {
   const { listProviderModels } = useListProviderModels();
   const [catalog, setCatalog] = useState<IProviderModelItem[]>([]);
@@ -202,7 +234,7 @@ export function useModelsCatalog({
   // The result is merged into `catalog`; the displayed list then becomes
   // the union of catalog + instance models.
   const handleListModels = async () => {
-    const { apiKey, baseUrl } = resolveCreds();
+    const { apiKey, baseUrl, region, extensions } = resolveCreds();
     if (providerName === LLMFactory.VolcEngine && !apiKey) {
       setHasFetched(true);
       return;
@@ -211,8 +243,10 @@ export function useModelsCatalog({
     try {
       const ret = await listProviderModels({
         provider_name: providerName,
-        api_key: apiKey as any,
+        api_key: apiKey,
         base_url: baseUrl,
+        region,
+        extensions,
       });
       if (ret?.code === 0) {
         setCatalog(
@@ -243,8 +277,6 @@ export function useModelsCatalog({
   // reset `base_url` / `api_key` values, whereas reading them during
   // render would see the stale (pre-reset) values and defer forever.
 
-  const requiresApiKey = providerName === LLMFactory.VolcEngine;
-
   const hasAutoFetchedRef = useRef(false);
   useEffect(() => {
     if (hasAutoFetchedRef.current) return;
@@ -252,13 +284,23 @@ export function useModelsCatalog({
     if (!providerName) return;
 
     const creds = resolveCreds();
-    const hasBaseUrlField = creds.baseUrl !== undefined;
     const ready =
-      (!requiresApiKey || !!creds.apiKey) &&
-      (!hasBaseUrlField || !!creds.baseUrl);
+      areCatalogCredentialsReady(
+        providerName,
+        creds.apiKey,
+        creds.region,
+        creds.extensions.auth_mode,
+      ) && isCatalogBaseURLReady(providerName, creds.baseUrl);
     if (!ready) return;
-    hasAutoFetchedRef.current = true;
-    handleListModels();
+    const delay =
+      providerName === LLMFactory.Bedrock
+        ? BEDROCK_CATALOG_AUTO_FETCH_DEBOUNCE_MS
+        : 0;
+    const timer = window.setTimeout(() => {
+      hasAutoFetchedRef.current = true;
+      handleListModels();
+    }, delay);
+    return () => window.clearTimeout(timer);
     // oxlint-disable-next-line react/exhaustive-deps
   }, [
     providerName,
@@ -267,6 +309,8 @@ export function useModelsCatalog({
     apiKeyValue,
     baseUrlValue,
     instanceDetailsLoaded,
+    regionValue,
+    authMode,
   ]);
 
   // Mark `hasFetched` true once the per-instance query resolves — even if
@@ -310,7 +354,6 @@ interface UseModelsDerivedArgs {
    */
   isDraftInstance: boolean;
   onInstanceModelsChange: ModelsSectionProps['onInstanceModelsChange'];
-  onInstanceModelsEdited?: ModelsSectionProps['onInstanceModelsEdited'];
 }
 
 export function useModelsDerived({
@@ -319,7 +362,6 @@ export function useModelsDerived({
   draftModels,
   isDraftInstance,
   onInstanceModelsChange,
-  onInstanceModelsEdited,
 }: UseModelsDerivedArgs) {
   const catalogFeatures = useMemo(() => {
     const map = new Map<string, string[]>();
@@ -388,51 +430,25 @@ export function useModelsDerived({
     [sourceItems],
   );
 
-  // Keep the latest callbacks in refs so the effect below only fires
+  // Keep the latest callback in a ref so the effect below only fires
   // when `instanceItems` actually changes — not on every parent
   // re-render that passes a new arrow for the callbacks. The previous
   // deps included the callbacks directly, which made the effect re-run
   // with the same data on every render; that was harmless for the
-  // idempotent model_info push, but the new "edited" callback updates
-  // the host's last-saved baseline and must not absorb in-flight form
-  // edits fired by an unrelated re-render.
+  // idempotent model_info push.
   const onChangeRef = useRef(onInstanceModelsChange);
-  const onEditedRef = useRef(onInstanceModelsEdited);
   useEffect(() => {
     onChangeRef.current = onInstanceModelsChange;
-    onEditedRef.current = onInstanceModelsEdited;
   });
 
-  // Track the previous set of instance model names so we can tell
-  // "patch" (same names, different data) apart from "add/remove"
-  // (different names). Only the patch case needs to fire the host-side
-  // baseline-update callback so the next blur auto-save short-circuits.
-  const prevNamesRef = useRef<Set<string>>(new Set());
-
-  // Push the latest per-instance model list up to the host so its
-  // auto-save can include `model_info` in the payload. When the change
-  // is purely a patch (same names, different data), also notify the
-  // host via `onInstanceModelsEdited` so it can absorb the model_info
-  // diff into its last-saved baseline — without this signal, the next
-  // blur would signature-mismatch and fire a redundant PUT carrying
-  // the already-PATCH-saved model_info. Adds/removes intentionally
-  // skip this signal so the next blur still carries the updated list
-  // into PUT (the standard sync path for the instance's model_info).
+  // Push the latest per-instance model list up to the host so its next
+  // explicit save can include `model_info`. Persisted baseline updates
+  // are emitted by the mutation acknowledgement path below; a derived
+  // cache shape alone cannot prove that a PATCH succeeded.
   useEffect(() => {
-    const currentNames = new Set(instanceItems.map((m) => m.name));
-    const prevNames = prevNamesRef.current;
-    const isPatch =
-      currentNames.size > 0 &&
-      currentNames.size === prevNames.size &&
-      Array.from(currentNames).every((n) => prevNames.has(n));
-
+    if (!isDraftInstance && instanceModels === undefined) return;
     onChangeRef.current?.(buildModelInfo(instanceItems));
-    if (isPatch) {
-      onEditedRef.current?.();
-    }
-
-    prevNamesRef.current = currentNames;
-  }, [instanceItems]);
+  }, [instanceItems, instanceModels, isDraftInstance]);
 
   return { instanceItems, models, addedSet };
 }
@@ -499,7 +515,7 @@ interface UseModelVerifyArgs {
  * per-model `handleVerify` and batch `handleBatchVerify` so both paths
  * use identical credential resolution logic.
  */
-function buildVerifyArgs(
+export function buildVerifyArgs(
   model: IProviderModelItem,
   providerName: string,
   resolveCreds: () => ResolvedCreds,
@@ -524,11 +540,12 @@ function buildVerifyArgs(
     const transformed = verifyTransform(formValues);
     apiKey = transformed.apiKey;
     baseUrl = transformed.baseUrl;
-    region = transformed.region;
+    region = transformed.region ?? (formValues.region as string | undefined);
   } else {
     const creds = resolveCreds();
     apiKey = creds.apiKey;
     baseUrl = creds.baseUrl;
+    region = creds.region;
   }
 
   // `api_key` is typed `string` on the service signature, but
@@ -579,7 +596,7 @@ export function useModelVerify({
     });
   }, [instanceModels]);
 
-  const handleVerify = async (model: IProviderModelItem) => {
+  const handleVerify = async (model: IProviderModelItem): Promise<boolean> => {
     setVerify((prev) => ({ ...prev, [model.name]: 'loading' }));
     try {
       const ret = await verifyProviderConnection(
@@ -596,8 +613,10 @@ export function useModelVerify({
         ...prev,
         [model.name]: ret.code === 0 ? 'success' : 'error',
       }));
+      return ret.code === 0;
     } catch {
       setVerify((prev) => ({ ...prev, [model.name]: 'error' }));
+      return false;
     }
   };
 
@@ -672,8 +691,6 @@ interface UseModelMutationsArgs {
   instanceName: string;
   isDraftInstance: boolean;
   hideActions: boolean;
-  resolveCreds: () => ResolvedCreds;
-  instance: IProviderInstance | undefined;
   instanceItems: IProviderModelItem[];
   filteredModels: IProviderModelItem[];
   addedSet: Set<string>;
@@ -688,6 +705,10 @@ interface UseModelMutationsArgs {
   addDraftModel?: (model: IProviderModelItem) => void;
   removeDraftModel?: (name: string) => void;
   setDraftModelsList?: (models: IProviderModelItem[]) => void;
+  buildInstanceUpdatePayload?: (
+    modelInfo: IModelInfo[],
+  ) => Record<string, any> | null;
+  onInstanceModelsEdited?: (modelInfo: IModelInfo[]) => void;
 }
 
 export function useModelMutations({
@@ -695,8 +716,6 @@ export function useModelMutations({
   instanceName,
   isDraftInstance,
   hideActions,
-  resolveCreds,
-  instance,
   instanceItems,
   filteredModels,
   addedSet,
@@ -705,19 +724,27 @@ export function useModelMutations({
   addDraftModel,
   removeDraftModel,
   setDraftModelsList,
+  buildInstanceUpdatePayload,
+  onInstanceModelsEdited,
 }: UseModelMutationsArgs) {
-  const { addInstanceModel } = useAddInstanceModel();
+  const { addInstanceModel, loading: addLoading } = useAddInstanceModel();
   const { deleteInstanceModels } = useDeleteInstanceModels();
   const { updateProviderInstance, loading: batchLoading } =
     useUpdateProviderInstance();
 
   // True when every model currently shown in the filtered list is already
   // attached to the instance — drives the +/- toggle on the batch button.
+  const batchModels = useMemo(
+    () =>
+      filteredModels.filter(
+        (model) => addedSet.has(model.name) || hasKnownModelTypes(model),
+      ),
+    [filteredModels, addedSet],
+  );
   const allFilteredAdded = useMemo(
     () =>
-      filteredModels.length > 0 &&
-      filteredModels.every((m) => addedSet.has(m.name)),
-    [filteredModels, addedSet],
+      batchModels.length > 0 && batchModels.every((m) => addedSet.has(m.name)),
+    [batchModels, addedSet],
   );
 
   const handleAddModel = async (model: IProviderModelItem) => {
@@ -726,9 +753,9 @@ export function useModelMutations({
     if (isDraftInstance) {
       addDraftModel?.(model);
       clearCatalogOverride(model.name);
-      return;
+      return true;
     }
-    await addInstanceModel({
+    const result = await addInstanceModel({
       provider_name: providerName,
       instance_name: instanceName,
       model_name: model.name,
@@ -739,7 +766,9 @@ export function useModelMutations({
         ...(model.extra ?? {}),
       },
     });
+    if (result?.code !== 0) return false;
     clearCatalogOverride(model.name);
+    return true;
   };
 
   const handleRemoveModel = async (model: IProviderModelItem) => {
@@ -755,13 +784,10 @@ export function useModelMutations({
   };
 
   const handleAddCustom = async (item: IProviderModelItem) => {
-    // Append the custom item to the local catalog so it shows up in the
-    // unioned `models` list immediately. Server-side persistence happens
-    // via `addInstanceModel` below (when there is a real instance).
-    setCatalog((prev) =>
-      prev.some((m) => m.name === item.name) ? prev : [...prev, item],
-    );
     if (hideActions || isDraftInstance) {
+      setCatalog((prev) =>
+        prev.some((m) => m.name === item.name) ? prev : [...prev, item],
+      );
       // For drafts the catalog entry alone is not enough — we also need
       // to mark the model as added so it flows into the save payload's
       // `model_info`. Without this, custom models added on a draft
@@ -771,9 +797,9 @@ export function useModelMutations({
         addDraftModel?.(item);
         clearCatalogOverride(item.name);
       }
-      return;
+      return true;
     }
-    await addInstanceModel({
+    const result = await addInstanceModel({
       provider_name: providerName,
       instance_name: instanceName,
       model_name: item.name,
@@ -781,7 +807,12 @@ export function useModelMutations({
       max_tokens: item.max_tokens ?? 0,
       extra: { is_tools: hasToolFeature(item.features), ...(item.extra ?? {}) },
     });
+    if (result?.code !== 0) return false;
+    setCatalog((prev) =>
+      prev.some((m) => m.name === item.name) ? prev : [...prev, item],
+    );
     clearCatalogOverride(item.name);
+    return true;
   };
 
   // Batch attach/detach the currently visible (filtered) models.
@@ -790,23 +821,23 @@ export function useModelMutations({
   //  - Draft: just rewrite the local draft list. The host save handler
   //    flushes the latest snapshot through the add-instance payload.
   const handleBatchToggleModels = async () => {
-    if (filteredModels.length === 0) return;
+    if (batchModels.length === 0) return;
 
     const byName = new Map<string, IProviderModelItem>();
     instanceItems.forEach((m) => byName.set(m.name, m));
 
     let nextModels: IProviderModelItem[];
     if (allFilteredAdded) {
-      const drop = new Set(filteredModels.map((m) => m.name));
+      const drop = new Set(batchModels.map((m) => m.name));
       nextModels = Array.from(byName.values()).filter((m) => !drop.has(m.name));
     } else {
-      filteredModels.forEach((m) => byName.set(m.name, m));
+      batchModels.forEach((m) => byName.set(m.name, m));
       nextModels = Array.from(byName.values());
     }
 
     if (isDraftInstance) {
       setDraftModelsList?.(nextModels);
-      filteredModels.forEach((m) => {
+      batchModels.forEach((m) => {
         if (!addedSet.has(m.name)) {
           clearCatalogOverride(m.name);
         }
@@ -814,17 +845,13 @@ export function useModelMutations({
       return;
     }
 
-    const { apiKey, baseUrl } = resolveCreds();
-    await updateProviderInstance({
-      provider_name: providerName,
-      id: instance!.id,
-      instance_name: instanceName,
-      api_key: apiKey,
-      base_url: baseUrl,
-      region: instance?.region ?? 'default',
-      model_info: buildModelInfo(nextModels),
-    });
-    filteredModels.forEach((m) => {
+    const nextModelInfo = buildModelInfo(nextModels);
+    const payload = buildInstanceUpdatePayload?.(nextModelInfo);
+    if (!payload) return;
+    const result = await updateProviderInstance(payload as any);
+    if (result?.code !== 0) return;
+    onInstanceModelsEdited?.(nextModelInfo);
+    batchModels.forEach((m) => {
       if (!addedSet.has(m.name)) {
         clearCatalogOverride(m.name);
       }
@@ -833,10 +860,14 @@ export function useModelMutations({
 
   return {
     allFilteredAdded,
+    canBatchToggle:
+      batchModels.length > 0 &&
+      (isDraftInstance || Boolean(buildInstanceUpdatePayload)),
     handleAddModel,
     handleRemoveModel,
     handleAddCustom,
     handleBatchToggleModels,
+    addLoading,
     batchLoading,
   };
 }
@@ -853,6 +884,7 @@ interface UseModelEditArgs {
   updateCatalogModel: (name: string, item: IProviderModelItem) => void;
   clearCatalogOverride: (name: string) => void;
   updateDraftModel?: (item: IProviderModelItem) => void;
+  onInstanceModelsEdited?: ModelsSectionProps['onInstanceModelsEdited'];
 }
 
 export function useModelEdit({
@@ -863,6 +895,7 @@ export function useModelEdit({
   updateCatalogModel,
   clearCatalogOverride,
   updateDraftModel,
+  onInstanceModelsEdited,
 }: UseModelEditArgs) {
   const queryClient = useQueryClient();
   const customModelDialogFields = useCustomModelFields(providerName);
@@ -956,29 +989,7 @@ export function useModelEdit({
       return;
     }
 
-    queryClient.setQueryData<IInstanceModel[]>(
-      LlmKeys.instanceModels(providerName, instanceName),
-      (prev) => {
-        if (!prev) return prev;
-        const idx = prev.findIndex((m) => m.name === targetName);
-        if (idx === -1) return prev;
-        const next = [...prev];
-        const existing = next[idx];
-        next[idx] = {
-          ...existing,
-          max_tokens: item.max_tokens ?? 0,
-          model_type: item.model_types ?? [],
-          is_tools: hasToolFeature(item.features),
-          extra: {
-            is_tools: hasToolFeature(item.features),
-            ...(item.extra ?? {}),
-          },
-        };
-        return next;
-      },
-    );
-
-    await patchInstanceModel({
+    const result = await patchInstanceModel({
       provider_name: providerName,
       instance_name: instanceName,
       model_name: targetName,
@@ -986,6 +997,42 @@ export function useModelEdit({
       model_type: item.model_types ?? [],
       extra: { is_tools: hasToolFeature(item.features), ...(item.extra ?? {}) },
     });
+    if (result?.code !== 0) return;
+
+    const acknowledgedModels = queryClient.setQueryData<IInstanceModel[]>(
+      LlmKeys.instanceModels(providerName, instanceName),
+      (current) => {
+        if (!current) return current;
+        const next = current.map((model) =>
+          model.name === targetName
+            ? {
+                ...model,
+                max_tokens: item.max_tokens ?? 0,
+                model_type: item.model_types ?? [],
+                is_tools: hasToolFeature(item.features),
+                extra: {
+                  is_tools: hasToolFeature(item.features),
+                  ...(item.extra ?? {}),
+                },
+              }
+            : model,
+        );
+        return next;
+      },
+    );
+    if (acknowledgedModels) {
+      onInstanceModelsEdited?.(
+        acknowledgedModels.map((model) => ({
+          model_name: model.name,
+          model_type: model.model_type,
+          max_tokens: model.max_tokens,
+          extra: {
+            ...(model.extra ?? {}),
+            is_tools: Boolean(model.is_tools),
+          },
+        })),
+      );
+    }
     clearCatalogOverride(targetName);
     setEditingModel(null);
   };

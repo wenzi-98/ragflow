@@ -15,8 +15,10 @@
  */
 
 import Spotlight from '@/components/spotlight';
+import message from '@/components/ui/message';
 import { useTranslate } from '@/hooks/common-hooks';
 import {
+  LLMApiAction,
   LlmKeys,
   useAddProviderInstance,
   useFetchAddedProviders,
@@ -24,10 +26,11 @@ import {
   useUpdateProviderInstance,
 } from '@/hooks/use-llm-request';
 import { IProviderInstance } from '@/interfaces/database/llm';
-import { useQueryClient } from '@tanstack/react-query';
+import { useIsMutating, useQueryClient } from '@tanstack/react-query';
 import { Plus } from 'lucide-react';
 import { FC, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ProviderInstanceCardRef } from './instance-card/interface';
+import { useTranslation } from 'react-i18next';
+import type { ProviderInstanceCardRef } from './instance-card/interface';
 import { ProviderInstanceCard } from './instance-card/provider-instance-card';
 import { ProviderHeaderBar } from './layout/provider-header-bar';
 import { Sidebar, SidebarSelection } from './layout/sidebar';
@@ -59,6 +62,9 @@ import SystemSetting from './layout/system-setting';
  */
 const SettingModelV2: FC = () => {
   const { t: tSetting } = useTranslate('setting');
+  const { t: tFlow } = useTranslation('translation', {
+    keyPrefix: 'flow',
+  });
   const [selection, setSelection] = useState<SidebarSelection>('default');
   // Stack of draft-instance identifiers, rendered as `ProviderInstanceCard`
   // entries below the persisted instances. Each draft can be cancelled
@@ -66,6 +72,18 @@ const SettingModelV2: FC = () => {
   const [draftIds, setDraftIds] = useState<string[]>([]);
 
   const [saving, setSaving] = useState(false);
+  const modelMutationCount = useIsMutating({
+    predicate: (mutation) => {
+      const action = mutation.options.mutationKey?.[0];
+      return (
+        action === LLMApiAction.AddInstanceModel ||
+        action === LLMApiAction.DeleteInstanceModels ||
+        action === LLMApiAction.PatchInstanceModel ||
+        action === LLMApiAction.UpdateProviderInstance
+      );
+    },
+  });
+  const modelMutationPending = modelMutationCount > 0;
 
   // Tracks the instance name that was just persisted by the top Save
   // button. The corresponding saved card mounts expanded so the user
@@ -168,27 +186,29 @@ const SettingModelV2: FC = () => {
   //      (Bedrock saved cards carry an `id` so the backend
   //      updates instead of creating); generic and SoMark saved cards
   //      go through `updateProviderInstance`.
-  //   5. On success: clear drafts (they're persisted now), mark each
-  //      saved card's baseline so the next save short-circuits, and
-  //      invalidate the instance query so the new/updated cards appear.
+  //   5. On each success: remove that persisted draft or mark the saved
+  //      card's baseline so a later failure cannot leave acknowledged
+  //      state looking editable. Finally refresh the instance list.
   const handleSaveAll = useCallback(async () => {
-    const refs = Array.from(cardRefs.current.values()).filter(
-      (r): r is ProviderInstanceCardRef => r !== null,
+    if (modelMutationPending) return;
+    const refs = Array.from(cardRefs.current.entries()).flatMap(
+      ([cardId, ref]) => (ref ? [{ cardId, ref }] : []),
     );
     if (refs.length === 0) return;
 
-    const dirty = refs
-      .map((r) => ({ ref: r, payload: r.getSavePayload() }))
-      .filter((e) => e.payload !== null);
-    if (dirty.length === 0) return;
+    const participating = refs
+      .map(({ cardId, ref }) => ({
+        cardId,
+        ref,
+        payload: ref.getSavePayload(),
+      }))
+      .filter(
+        (entry) => entry.payload !== null || draftIds.includes(entry.cardId),
+      );
+    if (participating.length === 0) return;
 
-    const validations = await Promise.all(
-      dirty.map(async (e) => ({ ...e, valid: await e.ref.validate() })),
-    );
-    if (validations.some((v) => !v.valid)) {
-      return;
-    }
-
+    // Freeze the cards before the first async boundary. Payloads above were
+    // captured synchronously, so validation cannot race with later edits.
     setSaving(true);
     // Pin the auto-show guard so a draft isn't re-spawned while the
     // providerInstances refetch is in flight (during that window both
@@ -196,21 +216,39 @@ const SettingModelV2: FC = () => {
     // `addDraft()`).
     cancelledRef.current = true;
     try {
+      const validations = await Promise.all(
+        participating.map(async (entry) => ({
+          ...entry,
+          valid: await entry.ref.validate(),
+        })),
+      );
+      if (validations.some((validation) => !validation.valid)) {
+        return;
+      }
+
       // 3. Dispatch one API call per dirty card. Sequential so any
       //    backend error stops the batch and the user can retry the
       //    remaining cards after fixing the issue.
-      for (const { ref, payload } of validations) {
+      for (const { cardId, ref, payload } of validations) {
         if (!payload) continue;
         if (payload.apiKind === 'add') {
           const ret = await addProviderInstance(payload.payload as any);
           if (ret?.code !== 0) {
-            // Stop on the first failure so the user can see the error.
+            // No write was acknowledged; preserve this and later drafts.
+            return;
+          }
+          if (ret.skippedExisting) {
+            message.error(
+              `${payload.instanceName}: ${tFlow('nameRepeatedMsg')}`,
+            );
             return;
           }
           // Remember the just-saved name so the persisted card mounts
           // expanded once it surfaces via the invalidated instances
           // query below.
           if (payload.isDraft) {
+            setDraftIds((previous) => previous.filter((id) => id !== cardId));
+            cardRefs.current.delete(cardId);
             setNewlySavedInstanceName(payload.instanceName);
           }
         } else {
@@ -219,15 +257,13 @@ const SettingModelV2: FC = () => {
             return;
           }
           // Saved card: update its dirty baseline so the next save
-          // short-circuits. Drafts are removed below so they don't
-          // need this.
-          ref.markSaved();
+          // short-circuits.
+          ref.markSaved(payload.payload);
         }
       }
-      // 4. Clear drafts (all valid drafts were just persisted) and
-      //    invalidate the instance query so the newly-saved cards
-      //    appear in the persisted list.
-      setDraftIds([]);
+      // 4. Refresh the instance query so newly-saved cards appear.
+      // Drafts were removed individually after their own acknowledged
+      // response, so empty or failed drafts remain available to fix.
       queryClient.invalidateQueries({
         queryKey: LlmKeys.providerInstances(providerQueryName),
       });
@@ -239,6 +275,9 @@ const SettingModelV2: FC = () => {
     updateProviderInstance,
     queryClient,
     providerQueryName,
+    draftIds,
+    modelMutationPending,
+    tFlow,
   ]);
 
   // Whether the Save button should be enabled. We avoid an O(n) ref
@@ -247,7 +286,10 @@ const SettingModelV2: FC = () => {
   // there is nothing to save, and if there is something the user can
   // always attempt a save (dirty saved cards short-circuit inside
   // `getSavePayload`). The button is disabled while a save is in flight.
-  const canSave = !saving && (draftIds.length > 0 || instances.length > 0);
+  const canSave =
+    !saving &&
+    !modelMutationPending &&
+    (draftIds.length > 0 || instances.length > 0);
 
   // User clicked Cancel on a specific draft - remove it from the list
   // and stop the auto-show effect from re-opening it for the current
@@ -265,11 +307,18 @@ const SettingModelV2: FC = () => {
     [],
   );
 
+  const handleSelectionChange = useCallback(
+    (nextSelection: SidebarSelection) => {
+      if (!saving) setSelection(nextSelection);
+    },
+    [saving],
+  );
+
   return (
     <div className="flex w-full h-full border-[0.5px] border-border-button rounded-lg relative overflow-hidden">
       <Spotlight />
       <section className="flex flex-col gap-4 w-[320px] shrink-0 px-5 border-r-[0.5px] border-border-button overflow-auto scrollbar-auto">
-        <Sidebar selection={selection} onSelect={setSelection} />
+        <Sidebar selection={selection} onSelect={handleSelectionChange} />
       </section>
       <section className="flex-1 flex flex-col overflow-hidden">
         {selection === 'default' ? (
@@ -287,7 +336,10 @@ const SettingModelV2: FC = () => {
             />
 
             {/* Scrollable middle: instance cards + optional draft cards */}
-            <div className="flex-1 overflow-auto scrollbar-auto p-4 flex flex-col gap-4">
+            <fieldset
+              disabled={saving}
+              className="flex-1 min-w-0 border-0 overflow-auto scrollbar-auto p-4 flex flex-col gap-4"
+            >
               {instances.length === 0 && draftIds.length === 0 && (
                 <div className="text-text-secondary text-sm py-6 text-center">
                   {tSetting('noInstancesConfigured')}
@@ -295,7 +347,7 @@ const SettingModelV2: FC = () => {
               )}
               {instances.map((instance, index) => (
                 <ProviderInstanceCard
-                  key={instance.instance_name}
+                  key={`${selection}:${instance.instance_name}`}
                   ref={setCardRef(instance.instance_name)}
                   providerName={selection as string}
                   instance={instance}
@@ -326,7 +378,7 @@ const SettingModelV2: FC = () => {
                   <span className="text-sm">{tSetting('addInstanceText')}</span>
                 </button>
               </div>
-            </div>
+            </fieldset>
           </>
         )}
       </section>

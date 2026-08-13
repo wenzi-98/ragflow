@@ -206,7 +206,6 @@ export const useFetchInstanceModels = (
 ) => {
   const { data, isFetching: loading } = useQuery<IInstanceModel[]>({
     queryKey: LlmKeys.instanceModels(providerName, instanceName),
-    initialData: [],
     gcTime: 0,
     enabled: !!providerName && !!instanceName && instanceName !== '__draft__',
     queryFn: async () => {
@@ -214,7 +213,10 @@ export const useFetchInstanceModels = (
         { provider_name: providerName, instance_name: instanceName },
         true,
       );
-      return data?.data ?? [];
+      if (data.code !== 0) {
+        throw new Error(data.message || 'Failed to load instance models');
+      }
+      return data.data ?? [];
     },
   });
 
@@ -280,7 +282,9 @@ export const useAddProviderInstance = () => {
             (i: IProviderInstance) => i.instance_name === params.instance_name,
           );
           if (instanceExists && !params.verify) {
-            return { code: 0, data: null };
+            // Preserve the legacy idempotent result while distinguishing it
+            // from an acknowledged write for batch-save callers.
+            return { code: 0, data: null, skippedExisting: true as const };
           }
         }
       } catch {
@@ -348,21 +352,24 @@ export const useListProviderModels = () => {
   const { isPending: loading, mutateAsync } = useMutation({
     mutationKey: [LLMApiAction.ListProviderModels],
     mutationFn: async (params: IListProviderModelsRequestBody) => {
-      const { provider_name, api_key, base_url } = params;
-      // GET /api/v1/providers/<provider_name>/models
-      // The API accepts api_key and base_url as optional query parameters.
-      // api_key is expected as a string; values in {} object form must be
-      // JSON-stringified before being sent.
-      const queryParams: Record<string, string> = {};
+      const { provider_name, api_key, base_url, region, extensions } = params;
+      // POST keeps API keys out of URLs, browser history, and
+      // access logs. The backend retains GET only for API compatibility.
+      const requestData: Record<string, unknown> = {};
       if (api_key) {
-        queryParams.api_key =
-          typeof api_key === 'string' ? api_key : JSON.stringify(api_key);
+        requestData.api_key = api_key;
       }
       if (base_url) {
-        queryParams.base_url = base_url;
+        requestData.base_url = base_url;
+      }
+      if (region) {
+        requestData.region = region;
+      }
+      if (extensions) {
+        requestData.extensions = extensions;
       }
       const { data } = await llmService.listProviderModels(
-        { provider_name, params: queryParams },
+        { provider_name, data: requestData },
         true,
       );
       return data;
@@ -388,6 +395,27 @@ export const useAddInstanceModel = () => {
     ) => {
       const { data } = await llmService.addInstanceModel(params);
       if (data.code === 0) {
+        queryClient.setQueryData<IInstanceModel[]>(
+          LlmKeys.instanceModels(params.provider_name, params.instance_name),
+          (previous = []) => {
+            const acknowledged: IInstanceModel = {
+              name: params.model_name,
+              model_type: params.model_type,
+              max_tokens: params.max_tokens,
+              status: 'active',
+              verify: 'unknown',
+              is_tools: Boolean(params.extra?.is_tools),
+              extra: params.extra,
+            };
+            const index = previous.findIndex(
+              (model) => model.name === params.model_name,
+            );
+            if (index < 0) return [...previous, acknowledged];
+            return previous.map((model, currentIndex) =>
+              currentIndex === index ? { ...model, ...acknowledged } : model,
+            );
+          },
+        );
         // `exact: true` keeps the invalidation to the provider summary
         // list. Without it the [AddedProviders] prefix would also match
         // every providerInstances / instanceModels query and refetch
@@ -560,6 +588,12 @@ export const useDeleteInstanceModels = () => {
     mutationFn: async (params: IDeleteInstanceModelsRequestBody) => {
       const { data } = await llmService.deleteInstanceModels(params);
       if (data.code === 0) {
+        const deletedNames = new Set(params.model_name);
+        queryClient.setQueryData<IInstanceModel[]>(
+          LlmKeys.instanceModels(params.provider_name, params.instance_name),
+          (previous = []) =>
+            previous.filter((model) => !deletedNames.has(model.name)),
+        );
         message.success(t('message.deleted'));
         queryClient.invalidateQueries({
           queryKey: LlmKeys.addedProviders(),
@@ -592,6 +626,30 @@ export const useUpdateProviderInstance = () => {
     mutationFn: async (params: IUpdateProviderInstanceRequestBody) => {
       const { data } = await llmService.updateProviderInstance(params);
       if (data.code === 0) {
+        if (Array.isArray(params.model_info)) {
+          queryClient.setQueryData<IInstanceModel[]>(
+            LlmKeys.instanceModels(params.provider_name, params.instance_name),
+            (previous) =>
+              params.model_info!.map((model) => {
+                const persisted = previous?.find(
+                  (item) => item.name === model.model_name,
+                );
+                return {
+                  ...persisted,
+                  name: model.model_name,
+                  max_tokens: model.max_tokens,
+                  model_type: Array.isArray(model.model_type)
+                    ? model.model_type
+                    : model.model_type
+                      ? [model.model_type]
+                      : [],
+                  status: persisted?.status ?? 'active',
+                  is_tools: Boolean(model.extra?.is_tools),
+                  extra: model.extra,
+                };
+              }),
+          );
+        }
         queryClient.invalidateQueries({
           queryKey: LlmKeys.addedProviders(),
           exact: true,

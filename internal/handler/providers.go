@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 // ProviderHandler provider handler
@@ -38,6 +40,13 @@ type ProviderHandler struct {
 	userService          *service.UserService
 	modelProviderService *service.ModelProviderService
 	userTenantDAO        *dao.UserTenantDAO
+}
+
+type listProviderModelsRequest struct {
+	APIKey     string                 `json:"api_key"`
+	BaseURL    string                 `json:"base_url"`
+	Region     string                 `json:"region"`
+	Extensions map[string]interface{} `json:"extensions"`
 }
 
 // NewProviderHandler create provider handler
@@ -160,33 +169,75 @@ func (h *ProviderHandler) ListModels(c *gin.Context) {
 		staticModels = []map[string]interface{}{}
 	}
 
-	// 2. Attempt live API fetch when api_key and base_url are provided
-	apiKey := c.Query("api_key")
-	baseURL := c.Query("base_url")
+	// 2. Attempt a live API fetch when an API key is provided. POST is
+	// preferred so secrets do not appear in URLs; GET remains supported.
+	var request listProviderModelsRequest
+	if c.Request.Method == http.MethodPost {
+		if err := c.ShouldBindJSON(&request); err != nil && !errors.Is(err, io.EOF) {
+			common.ErrorWithCode(c, common.CodeBadRequest, "Invalid request body")
+			return
+		}
+	}
+	apiKey := request.APIKey
+	baseURL := request.BaseURL
+	region := request.Region
+	if apiKey == "" {
+		apiKey = c.Query("api_key")
+	}
+	if baseURL == "" {
+		baseURL = c.Query("base_url")
+	}
+	if region == "" {
+		region = c.Query("region")
+	}
+	driverAPIKey, err := buildModelListAPIKey(providerName, apiKey, region, request.Extensions)
+	if err != nil {
+		common.ErrorWithCode(c, common.CodeBadRequest, err.Error())
+		return
+	}
 	var remoteModels []map[string]interface{}
+	isBedrockAPIKey := isBedrockAPIKeyConfig(providerName, driverAPIKey)
+	if isBedrockAPIKey {
+		staticModels = nil
+	}
 
-	if apiKey != "" && baseURL != "" {
+	if shouldListRemoteModels(driverAPIKey, baseURL, isBedrockAPIKey) {
 		providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
 		if providerInfo != nil && providerInfo.ModelDriver != nil {
-			region := "default"
-			baseURLByRegion := map[string]string{region: baseURL}
-			driver := providerInfo.ModelDriver.NewInstance(baseURLByRegion)
+			driver := providerInfo.ModelDriver
+			if baseURL != "" {
+				baseURLByRegion := map[string]string{"default": baseURL}
+				if region != "" {
+					baseURLByRegion[region] = baseURL
+				}
+				driver = providerInfo.ModelDriver.NewInstance(baseURLByRegion)
+			}
 			if driver != nil {
 				apiConfig := &models.APIConfig{
-					ApiKey: &apiKey,
-					Region: &region,
+					ApiKey: &driverAPIKey,
 				}
-				if liveModels, err := driver.ListModels(c.Request.Context(), apiConfig); err == nil {
+				if region != "" {
+					apiConfig.Region = &region
+				}
+				liveModels, listErr := driver.ListModels(c.Request.Context(), apiConfig)
+				if listErr != nil {
+					if isBedrockAPIKey {
+						common.ErrorWithCode(c, common.CodeConnectionError, listErr.Error())
+						return
+					}
+					common.Logger.Warn("failed to list remote provider models", zap.String("provider", providerName), zap.Error(listErr))
+				} else {
 					for _, m := range liveModels {
-						remoteModels = append(remoteModels, map[string]interface{}{
-							"name":        m.Name,
-							"model_types": m.ModelTypes,
-							"max_output":  m.MaxOutput,
-						})
+						remoteModels = append(remoteModels, providerListModelItem(m))
 					}
 				}
 			}
 		}
+	}
+
+	if isBedrockAPIKey && len(remoteModels) == 0 {
+		common.ErrorWithCode(c, common.CodeDataError, "No Bedrock models were discovered")
+		return
 	}
 
 	// 3. Both empty — return empty success
@@ -222,6 +273,66 @@ func (h *ProviderHandler) ListModels(c *gin.Context) {
 	common.SuccessWithData(c, result, "success")
 }
 
+func buildModelListAPIKey(providerName, apiKey, region string, extensions map[string]interface{}) (string, error) {
+	if !strings.EqualFold(providerName, "Bedrock") || len(extensions) == 0 {
+		return apiKey, nil
+	}
+	bedrockKey := make(map[string]interface{}, len(extensions)+2)
+	for key, value := range extensions {
+		switch key {
+		case "endpoint_type":
+			bedrockKey["bedrock_endpoint_type"] = value
+		case "endpoint_url":
+			bedrockKey["bedrock_endpoint_url"] = value
+		case "discovery_endpoint_url":
+			bedrockKey["bedrock_discovery_endpoint_url"] = value
+		default:
+			bedrockKey[key] = value
+		}
+	}
+	if region != "" {
+		bedrockKey["bedrock_region"] = region
+	}
+	if bedrockKey["auth_mode"] == "bedrock_api_key" {
+		bedrockKey["bedrock_api_key"] = apiKey
+	}
+	encoded, err := json.Marshal(bedrockKey)
+	if err != nil {
+		return "", fmt.Errorf("encode Bedrock model-list extensions: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func shouldListRemoteModels(apiKey, baseURL string, allowDefaultEndpoint bool) bool {
+	return apiKey != "" && (baseURL != "" || allowDefaultEndpoint)
+}
+
+func isBedrockAPIKeyConfig(providerName, apiKey string) bool {
+	if !strings.EqualFold(providerName, "Bedrock") || apiKey == "" {
+		return false
+	}
+	var keyConfig struct {
+		AuthMode string `json:"auth_mode"`
+	}
+	return json.Unmarshal([]byte(apiKey), &keyConfig) == nil && keyConfig.AuthMode == "bedrock_api_key"
+}
+
+func providerListModelItem(model models.ListModelResponse) map[string]interface{} {
+	maxTokens := 8192
+	if model.MaxOutput != nil {
+		maxTokens = *model.MaxOutput
+	}
+	modelTypes := model.ModelTypes
+	if modelTypes == nil {
+		modelTypes = []string{}
+	}
+	return map[string]interface{}{
+		"name":        model.Name,
+		"model_types": modelTypes,
+		"max_tokens":  maxTokens,
+	}
+}
+
 func (h *ProviderHandler) ShowModel(c *gin.Context) {
 	providerName := c.Param("provider_id_or_name")
 	if providerName == "" {
@@ -243,11 +354,32 @@ func (h *ProviderHandler) ShowModel(c *gin.Context) {
 }
 
 type CreateProviderInstanceRequest struct {
-	InstanceName string                            `json:"instance_name" binding:"required"`
-	APIKey       json.RawMessage                   `json:"api_key"`
-	BaseURL      string                            `json:"base_url"`
-	Region       string                            `json:"region"`
-	ModelInfo    []service.CreateInstanceModelInfo `json:"model_info"`
+	InstanceName string                             `json:"instance_name" binding:"required"`
+	APIKey       *json.RawMessage                   `json:"api_key"`
+	BaseURL      *string                            `json:"base_url"`
+	Region       *string                            `json:"region"`
+	ModelInfo    *[]service.CreateInstanceModelInfo `json:"model_info"`
+	rawFields    map[string]json.RawMessage
+}
+
+func (r *CreateProviderInstanceRequest) UnmarshalJSON(data []byte) error {
+	type request CreateProviderInstanceRequest
+	var decoded request
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*r = CreateProviderInstanceRequest(decoded)
+	r.rawFields = fields
+	return nil
+}
+
+func (r CreateProviderInstanceRequest) isNameOnly() bool {
+	_, hasInstanceName := r.rawFields["instance_name"]
+	return hasInstanceName && len(r.rawFields) == 1
 }
 
 // normalizeAPIKey accepts api_key as either a JSON string or a JSON object
@@ -285,12 +417,15 @@ func (h *ProviderHandler) CreateProviderInstance(c *gin.Context) {
 	}
 
 	userID := c.GetString("user_id")
-	apiKey := normalizeAPIKey(req.APIKey)
+	apiKey := ""
+	if req.APIKey != nil {
+		apiKey = normalizeAPIKey(*req.APIKey)
+	}
 
 	// If the request body only contains "instance_name", create a name-only
 	// instance without API key validation or model creation.
 	// Mirrors Python's provider_api.py:349 — set(data.keys()) == {"instance_name"}.
-	if apiKey == "" && req.BaseURL == "" && req.Region == "" && len(req.ModelInfo) == 0 {
+	if req.isNameOnly() {
 		code, err := h.modelProviderService.CreateNameOnlyProviderInstance(ctx, providerName, req.InstanceName, userID)
 		if err != nil {
 			common.ErrorWithCode(c, code, err.Error())
@@ -300,9 +435,20 @@ func (h *ProviderHandler) CreateProviderInstance(c *gin.Context) {
 		return
 	}
 
-	_, err := h.modelProviderService.CreateProviderInstance(ctx, providerName, req.InstanceName, apiKey, req.BaseURL, req.Region, userID, req.ModelInfo)
+	baseURL, region := "", ""
+	if req.BaseURL != nil {
+		baseURL = *req.BaseURL
+	}
+	if req.Region != nil {
+		region = *req.Region
+	}
+	var modelInfo []service.CreateInstanceModelInfo
+	if req.ModelInfo != nil {
+		modelInfo = *req.ModelInfo
+	}
+	code, err := h.modelProviderService.CreateProviderInstance(ctx, providerName, req.InstanceName, apiKey, baseURL, region, userID, modelInfo)
 	if err != nil {
-		common.ErrorWithCode(c, common.CodeServerError, err.Error())
+		common.ErrorWithCode(c, code, err.Error())
 		return
 	}
 
@@ -497,12 +643,40 @@ func (h *ProviderHandler) ShowTask(c *gin.Context) {
 }
 
 type AlterProviderInstanceRequest struct {
-	InstanceName string                            `json:"instance_name"`
-	APIKey       json.RawMessage                   `json:"api_key"`
-	BaseURL      string                            `json:"base_url"`
-	Region       string                            `json:"region"`
-	ModelInfo    []service.CreateInstanceModelInfo `json:"model_info"`
-	Verify       *bool                             `json:"verify"`
+	InstanceName *string                            `json:"instance_name"`
+	APIKey       *json.RawMessage                   `json:"api_key"`
+	BaseURL      *string                            `json:"base_url"`
+	Region       *string                            `json:"region"`
+	ModelInfo    *[]service.CreateInstanceModelInfo `json:"model_info"`
+	Verify       *bool                              `json:"verify"`
+	rawFields    map[string]json.RawMessage
+}
+
+func (r *AlterProviderInstanceRequest) UnmarshalJSON(data []byte) error {
+	type request AlterProviderInstanceRequest
+	var decoded request
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*r = AlterProviderInstanceRequest(decoded)
+	r.rawFields = fields
+	return nil
+}
+
+func (r AlterProviderInstanceRequest) hasField(name string) bool {
+	_, ok := r.rawFields[name]
+	return ok
+}
+
+func (r AlterProviderInstanceRequest) regionValue() string {
+	if r.Region == nil {
+		return ""
+	}
+	return *r.Region
 }
 
 func (h *ProviderHandler) AlterProviderInstance(c *gin.Context) {
@@ -524,6 +698,31 @@ func (h *ProviderHandler) AlterProviderInstance(c *gin.Context) {
 		common.ResponseWithHttpCodeData(c, http.StatusBadRequest, common.CodeBadRequest, nil, err.Error())
 		return
 	}
+	missing := make([]string, 0, 4)
+	if !req.hasField("instance_name") {
+		missing = append(missing, "instance_name")
+	}
+	if !req.hasField("api_key") {
+		missing = append(missing, "api_key")
+	}
+	if !req.hasField("base_url") {
+		missing = append(missing, "base_url")
+	}
+	if !req.hasField("model_info") {
+		missing = append(missing, "model_info")
+	}
+	if len(missing) > 0 {
+		common.ErrorWithCode(c, common.CodeBadRequest, fmt.Sprintf("Missing required fields: %s", strings.Join(missing, ", ")))
+		return
+	}
+	if req.InstanceName == nil {
+		common.ErrorWithCode(c, common.CodeBadRequest, "instance_name must not be null")
+		return
+	}
+	if req.ModelInfo == nil {
+		common.ErrorWithCode(c, common.CodeBadRequest, "model_info must be an array")
+		return
+	}
 
 	userID := c.GetString("user_id")
 	if userID == "" {
@@ -536,7 +735,19 @@ func (h *ProviderHandler) AlterProviderInstance(c *gin.Context) {
 		verify = *req.Verify
 	}
 
-	code, err := h.modelProviderService.AlterProviderInstance(ctx, userID, providerName, instanceName, req.InstanceName, normalizeAPIKey(req.APIKey), req.BaseURL, req.Region, req.ModelInfo, verify)
+	region := req.regionValue()
+	apiKey, baseURL := "", ""
+	if req.APIKey != nil {
+		apiKey = normalizeAPIKey(*req.APIKey)
+	}
+	if req.BaseURL != nil {
+		baseURL = *req.BaseURL
+	}
+	var modelInfo []service.CreateInstanceModelInfo
+	if req.ModelInfo != nil {
+		modelInfo = *req.ModelInfo
+	}
+	code, err := h.modelProviderService.AlterProviderInstance(ctx, userID, providerName, instanceName, *req.InstanceName, apiKey, baseURL, region, modelInfo, verify)
 	if err != nil {
 		common.ErrorWithCode(c, code, err.Error())
 		return

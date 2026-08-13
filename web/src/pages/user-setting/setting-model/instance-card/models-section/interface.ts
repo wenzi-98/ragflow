@@ -31,6 +31,12 @@ export interface ModelsSectionProps {
    */
   hideActions?: boolean;
   /**
+   * Keep model mutations local until the host saves updated credentials.
+   * Unlike a new draft, the local set is seeded from the instance's
+   * persisted models and is not auto-populated from the full catalog.
+   */
+  deferModelMutations?: boolean;
+  /**
    * True once the lazy-loaded instance details (which carry `api_key` /
    * `base_url` - the list endpoint omits them) have resolved. Providers
    * whose upstream model-list endpoint requires an api_key (e.g.
@@ -74,6 +80,14 @@ export interface ModelsSectionProps {
     modelInfo?: IModelInfo[];
   };
   /**
+   * Builds the host card's canonical instance-update payload with the
+   * supplied model selection. Keeping this builder in the host preserves
+   * provider-specific submit transforms during batch model changes.
+   */
+  buildInstanceUpdatePayload?: (
+    modelInfo: IModelInfo[],
+  ) => Record<string, any> | null;
+  /**
    * Notifies the host that ModelsSection has opened (or closed) a modal
    * dialog whose contents live in a React Portal outside the host's
    * `onBlurCapture` container. The host should temporarily disable its
@@ -87,19 +101,17 @@ export interface ModelsSectionProps {
    * The list is delivered already converted to the `IModelInfo[]`
    * shape expected by the update / add-provider-instance endpoints,
    * so the host can forward it verbatim in its auto-save payload.
-   * Fires once on mount with `[]` (initial empty state) and again
-   * whenever the per-instance fetch resolves or an add/remove mutation
-   * settles and the cache invalidates.
+   * Drafts publish their initial empty state immediately. Saved instances
+   * publish only after their model query has produced an authoritative
+   * snapshot, then again whenever a mutation updates that snapshot.
    */
   onInstanceModelsChange?: (modelInfo: IModelInfo[]) => void;
   /**
-   * Optional callback fired when the per-instance model list changes
-   * in a way that does NOT need the host to re-sync via its own
-   * auto-save — i.e. an existing model was patched (max_tokens /
-   * model_type / features changed via the edit dialog) but the model
-   * set stayed the same.
+   * Optional callback fired after a model mutation has been acknowledged
+   * by the backend, either through an individual PATCH or a batch instance
+   * update.
    *
-   * The PATCH endpoint already persisted the change server-side, so
+   * The mutation endpoint already persisted the change server-side, so
    * the host uses this signal to absorb the resulting model_info diff
    * into its last-saved baseline. The next blur-driven auto-save will
    * then short-circuit as a no-op (signature matches), avoiding a
@@ -107,11 +119,10 @@ export interface ModelsSectionProps {
    *
    * Pair with `onInstanceModelsChange`: that callback fires for every
    * change (add/remove/patch) so the host can keep its `modelInfoRef`
-   * current, while `onInstanceModelsEdited` fires ONLY for patches so
-   * the host can suppress its next auto-save for an already-persisted
-   * change.
+   * current, while `onInstanceModelsEdited` only fires for acknowledged
+   * mutations so the host can suppress a redundant follow-up save.
    */
-  onInstanceModelsEdited?: () => void;
+  onInstanceModelsEdited?: (modelInfo: IModelInfo[]) => void;
 }
 
 export interface ModelTypeBadgesProps {
@@ -133,10 +144,10 @@ export interface ModelRowProps {
   isAdded: boolean;
   verifyStatus: VerifyStatus;
   hideActions: boolean;
-  onVerify: () => void;
+  onVerify?: () => void;
   onAdd: () => void;
   onRemove: () => void;
-  onEdit: () => void;
+  onEdit?: () => void;
   editLabel: string;
   /** Whether this row is currently selected for batch operations. */
   isSelected?: boolean;

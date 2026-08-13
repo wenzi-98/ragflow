@@ -1372,19 +1372,59 @@ class BedrockCV(Base):
         Base.__init__(self, **kwargs)
 
     def _parse_credentials(self, key):
-        bedrock_key = json.loads(key)
+        from rag.utils.bedrock_endpoint import parse_bedrock_credentials, resolve_bedrock_endpoint, validate_bedrock_api_key, validate_bedrock_region
+
+        bedrock_key = parse_bedrock_credentials(key)
         self.auth_mode = bedrock_key.get("auth_mode", "")
-        self.aws_region = bedrock_key.get("bedrock_region", "us-east-1")
+        self.aws_region = bedrock_key.get("bedrock_region")
+        if not self.aws_region:
+            raise ValueError("Bedrock region must be provided in the key")
+        validate_bedrock_region(self.aws_region)
         self.aws_ak = bedrock_key.get("bedrock_ak", "")
         self.aws_sk = bedrock_key.get("bedrock_sk", "")
         self.aws_role_arn = bedrock_key.get("aws_role_arn", "")
+        self.bedrock_api_key = bedrock_key.get("bedrock_api_key", "")
+        if self.auth_mode == "bedrock_api_key":
+            self.bedrock_api_key = validate_bedrock_api_key(self.bedrock_api_key)
+        self.endpoint_type, self.endpoint_url = resolve_bedrock_endpoint(
+            self.auth_mode,
+            bedrock_key.get("bedrock_endpoint_type"),
+            bedrock_key.get("bedrock_endpoint_url") or "",
+        )
+        if self.auth_mode == "bedrock_api_key" and self.endpoint_type != "runtime":
+            provider_prefix = "openai" if self.endpoint_type == "mantle_openai" else "anthropic"
+            self.litellm_model_name = f"{provider_prefix}/{self.model_name.removeprefix('bedrock/')}"
+        else:
+            self.litellm_model_name = self.model_name
 
     def _get_aws_creds(self):
+        runtime_endpoint_args = {"aws_bedrock_runtime_endpoint": self.endpoint_url} if self.endpoint_url else {}
+        if self.auth_mode == "bedrock_api_key":
+            if not self.bedrock_api_key:
+                raise ValueError("Bedrock API key must be provided")
+            service = "bedrock-runtime" if self.endpoint_type == "runtime" else ("openai" if self.endpoint_type == "mantle_openai" else "anthropic")
+            logging.debug(
+                "Configuring Bedrock API-key vision path: auth_mode=%s endpoint_type=%s service=%s",
+                self.auth_mode,
+                self.endpoint_type,
+                service,
+            )
+            if self.endpoint_type == "runtime":
+                args = {
+                    "aws_region_name": self.aws_region,
+                    "aws_access_key_id": "bedrock-api-key",
+                    "aws_secret_access_key": "bedrock-api-key",
+                    "extra_headers": {"Authorization": f"Bearer {self.bedrock_api_key}"},
+                    **runtime_endpoint_args,
+                }
+                return args
+            return {"api_key": self.bedrock_api_key, "api_base": self.endpoint_url}
         if self.auth_mode == "access_key_secret":
             return {
                 "aws_region_name": self.aws_region,
                 "aws_access_key_id": self.aws_ak,
                 "aws_secret_access_key": self.aws_sk,
+                **runtime_endpoint_args,
             }
         elif self.auth_mode == "iam_role":
             import boto3
@@ -1397,9 +1437,11 @@ class BedrockCV(Base):
                 "aws_access_key_id": creds["AccessKeyId"],
                 "aws_secret_access_key": creds["SecretAccessKey"],
                 "aws_session_token": creds["SessionToken"],
+                **runtime_endpoint_args,
             }
-        else:
-            return {"aws_region_name": self.aws_region}
+        elif self.auth_mode == "assume_role":
+            return {"aws_region_name": self.aws_region, **runtime_endpoint_args}
+        raise ValueError(f"Unsupported Bedrock auth_mode: {self.auth_mode}")
 
     def describe_with_prompt(self, image, prompt=None):
         import litellm
@@ -1407,7 +1449,7 @@ class BedrockCV(Base):
         b64 = self.image2base64(image)
         messages = self.vision_llm_prompt(b64, prompt)
         res = litellm.completion(
-            model=self.model_name,
+            model=self.litellm_model_name,
             messages=messages,
             **self._get_aws_creds(),
         )
