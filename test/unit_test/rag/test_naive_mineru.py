@@ -64,6 +64,7 @@ def test_by_mineru_raw_keeps_general_vision_enrichment() -> None:
     sections, tables, returned_parser = by_mineru(
         filename="document.pdf",
         binary=b"pdf",
+        from_page=13,
         lang="Japanese",
         callback=lambda *_args, **_kwargs: None,
         tenant_id="tenant-1",
@@ -79,6 +80,7 @@ def test_by_mineru_raw_keeps_general_vision_enrichment() -> None:
     assert wrapper_calls[0]["tenant_id"] == "tenant-1"
     assert wrapper_calls[0]["sections"] == parser.sections
     assert wrapper_calls[0]["lang"] == "Japanese"
+    assert wrapper_calls[0]["section_page_offset"] == 13
     assert parser.parse_kwargs["lang"] == "Japanese"
 
 

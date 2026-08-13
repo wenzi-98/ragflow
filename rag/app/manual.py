@@ -250,6 +250,8 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
         def tag(pn, left, right, top, bottom):
             if pn + left + right + top + bottom == 0:
                 return ""
+            if name == "mineru":
+                pn += 1
             return "@@{}\t{:.1f}\t{:.1f}\t{:.1f}\t{:.1f}##".format(pn, left, right, top, bottom)
 
         chunks = []
@@ -271,6 +273,7 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
             sections=sections,
             callback=callback,
             lang=lang,
+            section_page_offset=from_page if name == "mineru" else 0,
             **kwargs,
         )
         res = tokenize_table(tbls, doc, eng, language=lang)

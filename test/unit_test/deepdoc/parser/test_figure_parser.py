@@ -247,6 +247,36 @@ def test_vision_figure_parser_preserves_empty_and_mixed_positions(monkeypatch):
 
 
 @pytest.mark.p1
+def test_pdf_wrapper_offsets_section_pages_for_figure_context(monkeypatch):
+    module, FakeImage = _load_figure_parser(monkeypatch)
+    model_config = {"llm_name": "vision-model"}
+    parser_instance = Mock(return_value=[])
+    figure = ((FakeImage(), ["caption"]), [(13, 0, 100, 40, 80)])
+    sections = [("Before", "@@1\t0.0\t100.0\t0.0\t20.0##")]
+
+    module.get_tenant_default_model_by_type = Mock(return_value=model_config)
+    module.LLMBundle = Mock(return_value=object())
+    module.VisionFigureParser = Mock(return_value=parser_instance)
+
+    module.vision_figure_parser_pdf_wrapper(
+        tbls=[figure],
+        sections=sections,
+        callback=lambda *_args, **_kwargs: None,
+        tenant_id="tenant-id",
+        parser_config={"image_context_size": 32},
+        section_page_offset=13,
+    )
+
+    module.append_context2table_image4pdf.assert_called_once_with(
+        sections,
+        [figure],
+        32,
+        return_context=True,
+        section_page_offset=13,
+    )
+
+
+@pytest.mark.p1
 @pytest.mark.parametrize(
     "wrapper_name",
     [

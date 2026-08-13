@@ -177,6 +177,7 @@ def by_mineru(
                         callback=callback,
                         tenant_id=tenant_id,
                         lang=lang,
+                        section_page_offset=from_page,
                         **kwargs,
                     )
                 return sections, tables, pdf_parser
@@ -1091,7 +1092,12 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
             return []
 
         if table_context_size or image_context_size:
-            tables = append_context2table_image4pdf(sections, tables, image_context_size)
+            tables = append_context2table_image4pdf(
+                sections,
+                tables,
+                image_context_size,
+                section_page_offset=from_page if name == "mineru" else 0,
+            )
 
         if name in ["tcadp", "docling", "mineru", "paddleocr", "opendataloader", "somark", "mistral ocr"]:
             if int(parser_config.get("chunk_token_num", 0)) <= 0:

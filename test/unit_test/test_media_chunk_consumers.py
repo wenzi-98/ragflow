@@ -1,5 +1,6 @@
 import importlib
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -39,6 +40,34 @@ def _load_manual_module(monkeypatch):
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module
+
+
+def _extract_positions(text):
+    positions = []
+    for tag in re.findall(r"@@[0-9-]+\t[0-9.\t]+##", text):
+        page, left, right, top, bottom = tag.strip("#").strip("@").split("\t")
+        positions.append(([int(value) - 1 for value in page.split("-")], float(left), float(right), float(top), float(bottom)))
+    return positions
+
+
+class _FakeMinerUParser:
+    def __init__(self, page_from: int = 0):
+        self.page_from = page_from
+
+    extract_positions = staticmethod(_extract_positions)
+
+    @staticmethod
+    def remove_tag(text):
+        return re.sub(r"@@[\t0-9.-]+?##", "", text)
+
+    def crop(self, text, need_position=False, **_kwargs):
+        positions = []
+        for pages, left, right, top, bottom in self.extract_positions(text):
+            if not pages or any(page < 0 for page in pages):
+                return (None, None) if need_position else None
+            positions.append((pages[0] + self.page_from, left, right, top, bottom))
+        image = object() if positions else None
+        return (image, positions) if need_position else image
 
 
 @pytest.fixture
@@ -83,6 +112,68 @@ def test_pdf_media_context_preserves_items_without_positions(monkeypatch):
 
     assert nlp.append_context2table_image4pdf([], [media_item], table_context_size=32) == [media_item]
     assert nlp.append_context2table_image4pdf([], [media_item], table_context_size=32, return_context=True) == [("", "")]
+
+
+@pytest.mark.parametrize(
+    "sections",
+    [
+        [("Before", "@@1\t0.0\t100.0\t0.0\t20.0##")],
+        [("Before", 0, [(0, 0.0, 100.0, 0.0, 20.0)])],
+        [("Before@@1\t0.0\t100.0\t0.0\t20.0##", "text")],
+    ],
+    ids=["raw", "manual", "paper"],
+)
+def test_pdf_media_context_offsets_mineru_section_pages(monkeypatch, sections):
+    parser_module = ModuleType("deepdoc.parser")
+    setattr(parser_module, "PdfParser", type("PdfParser", (), {"extract_positions": staticmethod(_extract_positions)}))
+    monkeypatch.setitem(sys.modules, "deepdoc.parser", parser_module)
+    media = [((None, "<table><tr><td>Cell</td></tr></table>"), [(13, 0.0, 100.0, 40.0, 80.0)])]
+
+    contextualized = nlp.append_context2table_image4pdf(
+        sections,
+        media,
+        table_context_size=32,
+        section_page_offset=13,
+    )
+
+    assert contextualized[0][0][1].startswith("Before")
+
+
+def test_manual_chunk_preserves_mineru_local_tag_and_global_page(monkeypatch, lightweight_tokenizer):
+    manual = _load_manual_module(monkeypatch)
+    parser = _FakeMinerUParser(page_from=13)
+    sections = [("Document body", "text", "@@1\t10.0\t190.0\t50.0\t100.0##")]
+    parsed = Mock(return_value=(sections, [], parser))
+    wrapper_calls = []
+
+    monkeypatch.setattr(manual, "PARSERS", {"mineru": parsed})
+    monkeypatch.setattr(manual, "normalize_layout_recognizer", lambda value: (value, None))
+    monkeypatch.setattr(manual, "extract_pdf_outlines", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(manual, "bullets_category", lambda texts: [0] * len(texts))
+    monkeypatch.setattr(manual, "title_frequency", lambda _bullets, titled: (0, [0] * len(titled)))
+    monkeypatch.setattr(manual, "num_tokens_from_string", lambda text: len(text.split()))
+
+    def capture_wrapper(tbls, **kwargs):
+        wrapper_calls.append(kwargs)
+        return tbls
+
+    monkeypatch.setattr(manual, "vision_figure_parser_pdf_wrapper", capture_wrapper)
+
+    chunks = manual.chunk(
+        "document.pdf",
+        binary=b"%PDF-1.4 fake",
+        from_page=13,
+        to_page=14,
+        lang="English",
+        callback=lambda *_args, **_kwargs: None,
+        parser_config={"layout_recognize": "MinerU", "chunk_token_num": 128, "delimiter": "\n"},
+    )
+
+    text_chunks = [chunk for chunk in chunks if chunk.get("doc_type_kwd") != "image"]
+    assert len(text_chunks) == 1
+    assert text_chunks[0]["page_num_int"] == [14]
+    assert text_chunks[0]["position_int"][0][0] == 14
+    assert wrapper_calls[0]["section_page_offset"] == 13
 
 
 @pytest.mark.parametrize(("parser_name", "folds_media_into_text"), [("MinerU", False), ("Docling", True)])

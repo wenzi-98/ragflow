@@ -114,7 +114,7 @@ def vision_figure_parser_figure_xlsx_wrapper(images, callback=None, lang="Englis
     return tbls
 
 
-def vision_figure_parser_pdf_wrapper(tbls, callback=None, lang="English", **kwargs):
+def vision_figure_parser_pdf_wrapper(tbls, callback=None, lang="English", section_page_offset: int = 0, **kwargs):
     lang = _normalize_vision_language(lang)
     if not tbls:
         return []
@@ -140,6 +140,7 @@ def vision_figure_parser_pdf_wrapper(tbls, callback=None, lang="English", **kwar
                 figures_data,
                 context_size,
                 return_context=True,
+                section_page_offset=section_page_offset,
             )
         try:
             docx_vision_parser = VisionFigureParser(
