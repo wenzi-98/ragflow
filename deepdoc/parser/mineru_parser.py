@@ -666,37 +666,44 @@ class MinerUParser(RAGFlowPdfParser):
         anchor_bbox = self._content_bbox_to_page_space(page_idx, output["bbox"])
         if anchor_bbox is None:
             return []
-        matches = []
-
-        for idx, block in enumerate(middle_blocks):
-            if block["type"] != "table":
-                continue
-
-            block_text = block.get("text", "")
-            is_anchor = block["page_idx"] == page_idx and self._overlap_ratio(anchor_bbox, block["bbox"]) >= 0.5
-            is_text_match = len(block_text) >= 4 and target_text and (block_text in target_text or target_text in block_text)
-            if is_anchor or is_text_match:
-                matches.append((idx, block, is_anchor, is_text_match))
-
-        anchor_indices = [idx for idx, _, is_anchor, _ in matches if is_anchor]
-        if not anchor_indices:
+        anchor_candidates = [
+            (self._overlap_ratio(anchor_bbox, block["bbox"]), idx, block)
+            for idx, block in enumerate(middle_blocks)
+            if block["type"] == "table" and block["page_idx"] == page_idx
+        ]
+        anchor_candidates = [candidate for candidate in anchor_candidates if candidate[0] >= 0.5]
+        if not anchor_candidates:
             return []
 
-        first_anchor_idx = min(anchor_indices)
-        positions = []
-        seen = set()
+        _overlap, anchor_idx, anchor = max(anchor_candidates, key=lambda candidate: (candidate[0], -candidate[1]))
+        positions = [{"page_idx": anchor["page_idx"], "bbox": anchor["bbox"]}]
+        anchor_text = anchor.get("text", "")
+        anchor_offset = target_text.find(anchor_text) if anchor_text else -1
+        if anchor_offset < 0:
+            return positions
+        search_from = anchor_offset + len(anchor_text)
 
-        for idx, block, is_anchor, is_text_match in matches:
-            if not (is_anchor or (idx >= first_anchor_idx and is_text_match)):
+        expected_page = page_idx + 1
+        for block in middle_blocks[anchor_idx + 1 :]:
+            if block["type"] != "table":
                 continue
-
-            key = (block["page_idx"], *[round(v, 3) for v in block["bbox"]])
-            if key in seen:
+            block_page = block["page_idx"]
+            if block_page < expected_page:
                 continue
-            seen.add(key)
-            positions.append({"page_idx": block["page_idx"], "bbox": block["bbox"]})
+            if block_page > expected_page:
+                break
 
-        positions.sort(key=lambda item: (item["page_idx"], item["bbox"][1], item["bbox"][0]))
+            block_text = block.get("text", "")
+            if len(block_text) < 4 or not target_text:
+                break
+            match_offset = target_text.find(block_text, search_from)
+            if match_offset < 0:
+                break
+
+            positions.append({"page_idx": block_page, "bbox": block["bbox"]})
+            search_from = match_offset + len(block_text)
+            expected_page += 1
+
         return positions
 
     def _enrich_outputs_with_middle_positions(self, outputs: list[dict[str, Any]], middle_json: Path):

@@ -874,6 +874,120 @@ def test_middle_positions_ignore_malformed_output_bbox(monkeypatch):
     assert positions == []
 
 
+def test_middle_positions_choose_highest_overlap_anchor(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    parser.page_sizes = {0: (200, 400), 1: (200, 400)}
+    output = {
+        "type": module.MinerUContentType.TABLE,
+        "table_body": "anchor continuation",
+        "table_caption": [],
+        "table_footnote": [],
+        "bbox": [100, 100, 900, 900],
+        "page_idx": 0,
+    }
+    middle_blocks = [
+        {"type": "table", "page_idx": 0, "bbox": (20, 40, 180, 360), "text": "anchor"},
+        {"type": "table", "page_idx": 0, "bbox": (25, 45, 175, 350), "text": "wrong"},
+        {"type": "table", "page_idx": 1, "bbox": (20, 0, 180, 80), "text": "continuation"},
+    ]
+
+    assert parser._middle_positions_for_output(output, middle_blocks) == [
+        {"page_idx": 0, "bbox": (20, 40, 180, 360)},
+        {"page_idx": 1, "bbox": (20, 0, 180, 80)},
+    ]
+
+
+def test_middle_positions_ignore_same_page_unrelated_table(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    parser.page_sizes = {0: (200, 400), 1: (200, 400)}
+    output = {
+        "type": module.MinerUContentType.TABLE,
+        "table_body": "anchor continuation",
+        "table_caption": [],
+        "table_footnote": [],
+        "bbox": [100, 100, 900, 900],
+        "page_idx": 0,
+    }
+    middle_blocks = [
+        {"type": "table", "page_idx": 0, "bbox": (20, 40, 180, 360), "text": "anchor"},
+        {"type": "table", "page_idx": 0, "bbox": (0, 0, 10, 10), "text": "continuation"},
+    ]
+
+    assert parser._middle_positions_for_output(output, middle_blocks) == [
+        {"page_idx": 0, "bbox": (20, 40, 180, 360)},
+    ]
+
+
+def test_middle_positions_stop_at_page_gap(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    parser.page_sizes = {0: (200, 400), 5: (200, 400)}
+    output = {
+        "type": module.MinerUContentType.TABLE,
+        "table_body": "anchor repeated text",
+        "table_caption": [],
+        "table_footnote": [],
+        "bbox": [100, 100, 900, 900],
+        "page_idx": 0,
+    }
+    middle_blocks = [
+        {"type": "table", "page_idx": 0, "bbox": (20, 40, 180, 360), "text": "anchor"},
+        {"type": "table", "page_idx": 5, "bbox": (20, 0, 180, 80), "text": "repeatedtext"},
+    ]
+
+    assert parser._middle_positions_for_output(output, middle_blocks) == [
+        {"page_idx": 0, "bbox": (20, 40, 180, 360)},
+    ]
+
+
+def test_middle_positions_require_monotonic_target_text(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    parser.page_sizes = {0: (200, 400), 1: (200, 400), 2: (200, 400)}
+    output = {
+        "type": module.MinerUContentType.TABLE,
+        "table_body": "anchor first second",
+        "table_caption": [],
+        "table_footnote": [],
+        "bbox": [100, 100, 900, 900],
+        "page_idx": 0,
+    }
+    middle_blocks = [
+        {"type": "table", "page_idx": 0, "bbox": (20, 40, 180, 360), "text": "anchor"},
+        {"type": "table", "page_idx": 1, "bbox": (20, 0, 180, 80), "text": "second"},
+        {"type": "table", "page_idx": 2, "bbox": (20, 0, 180, 80), "text": "first"},
+    ]
+
+    assert parser._middle_positions_for_output(output, middle_blocks) == [
+        {"page_idx": 0, "bbox": (20, 40, 180, 360)},
+        {"page_idx": 1, "bbox": (20, 0, 180, 80)},
+    ]
+
+
+def test_middle_positions_do_not_reuse_short_repeated_text(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    parser.page_sizes = {0: (200, 400), 1: (200, 400)}
+    output = {
+        "type": module.MinerUContentType.TABLE,
+        "table_body": "total",
+        "table_caption": [],
+        "table_footnote": [],
+        "bbox": [100, 100, 900, 900],
+        "page_idx": 0,
+    }
+    middle_blocks = [
+        {"type": "table", "page_idx": 0, "bbox": (20, 40, 180, 360), "text": "total"},
+        {"type": "table", "page_idx": 1, "bbox": (20, 0, 180, 80), "text": "total"},
+    ]
+
+    assert parser._middle_positions_for_output(output, middle_blocks) == [
+        {"page_idx": 0, "bbox": (20, 40, 180, 360)},
+    ]
+
+
 def test_read_output_keeps_original_tag_when_middle_json_has_single_table_position(monkeypatch, tmp_path):
     module = _load_mineru_parser(monkeypatch)
     parser = module.MinerUParser()
