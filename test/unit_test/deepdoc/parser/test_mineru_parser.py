@@ -338,6 +338,151 @@ class _FakePageImage:
         self.size = (width, height)
 
 
+class _FakePdfPage:
+    def __init__(self, width: int, height: int, *, render_error: bool = False):
+        self.width = width
+        self.height = height
+        self._render_error = render_error
+
+    def to_image(self, **_kwargs):
+        if self._render_error:
+            raise RuntimeError("PDFium: Data format error")
+        return type("RenderedPage", (), {"original": _FakePageImage(self.width, self.height)})()
+
+
+class _FakePdf:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def test_images_renders_only_requested_page_range(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    pages = [_FakePdfPage(612, 792, render_error=True) for _ in range(13)] + [_FakePdfPage(612, 792)]
+    monkeypatch.setattr(module.pdfplumber, "open", lambda *_args, **_kwargs: _FakePdf(pages))
+
+    parser.__images__("sample.pdf", page_from=13, page_to=14)
+
+    assert parser.page_images is not None
+    assert len(parser.page_images) == 1
+    assert parser.page_sizes == {0: (612.0, 792.0)}
+
+
+def test_media_bbox_uses_local_page_metadata_when_rendering_fails(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    pages = [_FakePdfPage(612, 792) for _ in range(13)] + [_FakePdfPage(612, 792, render_error=True)]
+    monkeypatch.setattr(module.pdfplumber, "open", lambda *_args, **_kwargs: _FakePdf(pages))
+
+    parser.__images__("sample.pdf", page_from=13, page_to=14)
+
+    assert parser.page_images is None
+    assert parser.page_sizes == {0: (612.0, 792.0)}
+    output = {
+        "type": module.MinerUContentType.IMAGE,
+        "bbox": [196, 210, 823, 763],
+        "page_idx": 0,
+    }
+    assert parser._line_tag(output) == "@@1\t120.0\t503.7\t166.3\t604.3##"
+
+
+def test_crop_uses_local_page_tag_and_returns_global_page_position(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    parser.page_from = 13
+    parser.page_images = [module.Image.new("RGB", (100, 200), "white")]
+
+    image, positions = parser.crop("@@1\t10\t40\t50\t80##", need_position=True)
+
+    assert image is not None
+    assert positions == [(13, 10, 40, 50, 80)]
+
+
+def test_parse_pdf_threads_page_range_into_renderer(monkeypatch, tmp_path):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    captured = {}
+
+    def capture_images(_pdf, zoomin=1, page_from=0, page_to=module.MAXIMUM_PAGE_NUMBER, callback=None):
+        captured.update(zoomin=zoomin, page_from=page_from, page_to=page_to, callback=callback)
+
+    monkeypatch.setattr(parser, "__images__", capture_images)
+    monkeypatch.setattr(parser, "_run_mineru", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(parser, "_read_output", lambda *_args, **_kwargs: [])
+
+    parser.parse_pdf(
+        filepath=tmp_path / "sample.pdf",
+        binary=b"%PDF-1.4 fake",
+        output_dir=str(tmp_path / "output"),
+        delete_output=False,
+        page_from=13,
+        page_to=14,
+    )
+
+    assert captured == {"zoomin": 1, "page_from": 13, "page_to": 14, "callback": None}
+
+
+def test_pdf_open_and_render_use_shared_pdfplumber_lock(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    lock = module.sys.modules[module.LOCK_KEY_pdfplumber]
+
+    class _LockCheckingPage(_FakePdfPage):
+        def to_image(self, **kwargs):
+            assert lock.locked()
+            return super().to_image(**kwargs)
+
+    pages = [_LockCheckingPage(612, 792)]
+
+    def open_pdf(*_args, **_kwargs):
+        assert lock.locked()
+        return _FakePdf(pages)
+
+    monkeypatch.setattr(module.pdfplumber, "open", open_pdf)
+
+    parser.__images__("sample.pdf")
+
+    assert parser.page_images is not None
+    assert not lock.locked()
+
+
+def test_media_bbox_is_omitted_when_page_size_is_unavailable(monkeypatch):
+    module = _load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    parser.page_sizes = {0: (100.0, 200.0)}
+    monkeypatch.setattr(module.pdfplumber, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cannot open PDF")))
+
+    parser.__images__("sample.pdf")
+
+    assert parser.page_sizes == {}
+    output = {
+        "type": module.MinerUContentType.IMAGE,
+        "bbox": [100, 100, 900, 900],
+        "page_idx": 0,
+    }
+    assert parser._line_tag(output) == ""
+    assert (
+        parser._middle_positions_for_output(
+            {
+                "type": module.MinerUContentType.TABLE,
+                "table_body": "<table><tr><td>row</td></tr></table>",
+                "table_caption": [],
+                "table_footnote": [],
+                "bbox": [100, 100, 900, 900],
+                "page_idx": 0,
+            },
+            [{"type": "table", "page_idx": 0, "bbox": (10, 10, 90, 90), "text": "row"}],
+        )
+        == []
+    )
+
+
 def test_read_output_enriches_cross_page_table_positions_from_middle_json(monkeypatch, tmp_path):
     module = _load_mineru_parser(monkeypatch)
     parser = module.MinerUParser()

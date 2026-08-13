@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from os import PathLike
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 import numpy as np
 import pdfplumber
@@ -146,6 +146,11 @@ class MinerUParser(RAGFlowPdfParser):
         self.mineru_api = mineru_api.rstrip("/")
         self.mineru_server_url = mineru_server_url.rstrip("/")
         self.outlines = []
+        self.page_from = 0
+        self.page_to = MAXIMUM_PAGE_NUMBER
+        self.page_images: list[Image.Image] | None = None
+        self.page_sizes: dict[int, tuple[float, float]] = {}
+        self.total_page = 0
         self.logger = logging.getLogger(self.__class__.__name__)
 
     @staticmethod
@@ -352,16 +357,31 @@ class MinerUParser(RAGFlowPdfParser):
             raise RuntimeError(f"[MinerU] api failed with exception {e}")
 
     def __images__(self, fnm, zoomin: int = 1, page_from=0, page_to=MAXIMUM_PAGE_NUMBER, callback=None):
+        """Render the requested PDF slice and cache dimensions by local page index."""
         self.page_from = page_from
         self.page_to = page_to
+        self.page_images = None
+        self.page_sizes = {}
+        self.total_page = 0
         try:
-            with pdfplumber.open(fnm) if isinstance(fnm, (str, PathLike)) else pdfplumber.open(BytesIO(fnm)) as pdf:
-                self.pdf = pdf
-                self.page_images = [p.to_image(resolution=72 * zoomin, antialias=True).original for _, p in enumerate(self.pdf.pages[page_from:page_to])]
-        except Exception as e:
-            self.page_images = None
-            self.total_page = 0
-            self.logger.exception(e)
+            with cast(threading.Lock, sys.modules[LOCK_KEY_pdfplumber]):
+                with pdfplumber.open(fnm) if isinstance(fnm, (str, PathLike)) else pdfplumber.open(BytesIO(fnm)) as pdf:
+                    self.pdf = pdf
+                    pages = self.pdf.pages[page_from:page_to]
+                    # MinerU restarts page_idx at zero after slicing, so all render
+                    # metadata remains local until a consumer emits global positions.
+                    self.page_sizes = {page_idx: (float(page.width), float(page.height)) for page_idx, page in enumerate(pages)}
+                    self.total_page = len(pages)
+                    self.page_images = [page.to_image(resolution=72 * zoomin, antialias=True).original for page in pages]
+        except Exception:
+            self.logger.exception("[MinerU] Failed to render PDF pages; using page metadata for bbox projection when available.")
+
+    def _get_page_size(self, page_idx: int) -> tuple[float, float] | None:
+        """Return the coordinate-space size for a sliced-document page index."""
+        if self.page_images and 0 <= page_idx < len(self.page_images):
+            width, height = self.page_images[page_idx].size
+            return float(width), float(height)
+        return self.page_sizes.get(page_idx)
 
     @staticmethod
     def _normalize_bbox(bbox):
@@ -373,20 +393,24 @@ class MinerUParser(RAGFlowPdfParser):
             top, bott = bott, top
         return x0, top, x1, bott
 
-    def _content_bbox_to_page_space(self, page_idx, bbox):
+    def _content_bbox_to_page_space(self, page_idx, bbox) -> tuple[float, float, float, float] | None:
         x0, top, x1, bott = self._normalize_bbox(bbox)
-        if hasattr(self, "page_images") and self.page_images and len(self.page_images) > page_idx:
-            page_width, page_height = self.page_images[page_idx].size
-            x0 = (x0 / 1000.0) * page_width
-            x1 = (x1 / 1000.0) * page_width
-            top = (top / 1000.0) * page_height
-            bott = (bott / 1000.0) * page_height
+        page_size = self._get_page_size(page_idx)
+        if page_size is None:
+            self.logger.warning("[MinerU] Missing page size for page_idx=%s; omitting bbox=%s", page_idx, bbox)
+            return None
+        page_width, page_height = page_size
+        x0 = (x0 / 1000.0) * page_width
+        x1 = (x1 / 1000.0) * page_width
+        top = (top / 1000.0) * page_height
+        bott = (bott / 1000.0) * page_height
         return x0, top, x1, bott
 
     def _middle_bbox_to_page_space(self, page_idx, bbox, page_size=None):
         x0, top, x1, bott = self._normalize_bbox(bbox)
-        if hasattr(self, "page_images") and self.page_images and len(self.page_images) > page_idx:
-            page_width, page_height = self.page_images[page_idx].size
+        target_page_size = self._get_page_size(page_idx)
+        if target_page_size is not None:
+            page_width, page_height = target_page_size
             if max(abs(x0), abs(x1), abs(top), abs(bott)) <= 1:
                 x0, x1 = x0 * page_width, x1 * page_width
                 top, bott = top * page_height, bott * page_height
@@ -411,7 +435,8 @@ class MinerUParser(RAGFlowPdfParser):
         if middle_positions:
             return "".join(self._format_line_tag(pos["page_idx"], pos["bbox"]) for pos in middle_positions)
 
-        return self._format_line_tag(bx["page_idx"], self._content_bbox_to_page_space(bx["page_idx"], bx.get("bbox", (0, 0, 0, 0))))
+        bbox = self._content_bbox_to_page_space(bx["page_idx"], bx.get("bbox", (0, 0, 0, 0)))
+        return self._format_line_tag(bx["page_idx"], bbox) if bbox is not None else ""
 
     def crop(self, text, ZM=1, need_position=False):
         imgs = []
@@ -421,13 +446,14 @@ class MinerUParser(RAGFlowPdfParser):
                 return None, None
             return
 
-        if not getattr(self, "page_images", None):
+        page_images = self.page_images
+        if not page_images:
             self.logger.warning("[MinerU] crop called without page images; skipping image generation.")
             if need_position:
                 return None, None
             return
 
-        page_count = len(self.page_images)
+        page_count = len(page_images)
 
         filtered_poss = []
         for pns, left, right, top, bottom in poss:
@@ -459,7 +485,7 @@ class MinerUParser(RAGFlowPdfParser):
             if need_position:
                 return None, None
             return
-        last_page_height = self.page_images[last_page_idx].size[1]
+        last_page_height = page_images[last_page_idx].size[1]
         poss.append(
             (
                 [last_page_idx],
@@ -479,7 +505,7 @@ class MinerUParser(RAGFlowPdfParser):
 
             for pn in pns[1:]:
                 if 0 <= pn - 1 < page_count:
-                    bottom += self.page_images[pn - 1].size[1]
+                    bottom += page_images[pn - 1].size[1]
                 else:
                     self.logger.warning(f"[MinerU] Page index {pn}-1 out of range for {page_count} pages during crop; skipping height accumulation.")
 
@@ -487,7 +513,7 @@ class MinerUParser(RAGFlowPdfParser):
                 self.logger.warning(f"[MinerU] Base page index {pns[0]} out of range for {page_count} pages during crop; skipping this segment.")
                 continue
 
-            img0 = self.page_images[pns[0]]
+            img0 = page_images[pns[0]]
             x0, y0, x1, y1 = int(left), int(top), int(right), int(min(bottom, img0.size[1]))
             if x0 > x1:
                 x0, x1 = x1, x0
@@ -505,7 +531,7 @@ class MinerUParser(RAGFlowPdfParser):
                 if not (0 <= pn < page_count):
                     self.logger.warning(f"[MinerU] Page index {pn} out of range for {page_count} pages during crop; skipping this page.")
                     continue
-                page = self.page_images[pn]
+                page = page_images[pn]
                 x0, y0, x1, y1 = int(left), 0, int(right), int(min(bottom, page.size[1]))
                 if x0 > x1:
                     x0, x1 = x1, x0
@@ -638,6 +664,8 @@ class MinerUParser(RAGFlowPdfParser):
         target_text = self._table_match_text(output)
         page_idx = int(output["page_idx"])
         anchor_bbox = self._content_bbox_to_page_space(page_idx, output["bbox"])
+        if anchor_bbox is None:
+            return []
         matches = []
 
         for idx, block in enumerate(middle_blocks):
@@ -976,7 +1004,7 @@ class MinerUParser(RAGFlowPdfParser):
         if callback:
             callback(0.15, f"[MinerU] Output directory: {out_dir}")
 
-        self.__images__(pdf, zoomin=1)
+        self.__images__(pdf, zoomin=1, page_from=page_from, page_to=page_to)
 
         try:
             options = MinerUParseOptions(
