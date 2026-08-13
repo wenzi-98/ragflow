@@ -784,16 +784,23 @@ class Parser(ProcessBase):
         if conf.get("output_format") == "markdown":
             mkdn = ""
             for b in bboxes:
-                if b.get("layout_type", "") == "title":
+                layout_type = b.get("layout_type", "")
+                text = str(b.get("text") or "")
+                if layout_type == "title":
                     mkdn += "\n## "
-                if b.get("layout_type", "") == "figure":
+                if layout_type == "figure":
                     image = b.get("image")
                     if image is None:
-                        logging.warning(f"Skipping figure in markdown output for {name}: image resource is unavailable (parse_method={parse_method}).")
+                        if text:
+                            mkdn += text + "\n"
+                        else:
+                            logging.warning(f"Skipping empty figure in markdown output for {name} (parse_method={parse_method}).")
                         continue
                     mkdn += "\n![Image]({})".format(VLM.image2base64(image))
+                    if text:
+                        mkdn += f"\n{text}\n"
                     continue
-                mkdn += b.get("text", "") + "\n"
+                mkdn += text + "\n"
             self.set_output("markdown", mkdn)
 
     def _spreadsheet(self, name, blob, **kwargs):

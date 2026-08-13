@@ -1,88 +1,118 @@
-import ast
-import copy
 import logging
-from collections.abc import Callable
-from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from unittest.mock import Mock
 
-MarkdownRenderer = Callable[[list[dict[str, object]], str, str], str]
+from PIL import Image
 
-
-class _FakeVLM:
-    calls: list[object] = []
-
-    @classmethod
-    def image2base64(cls, image: object) -> str:
-        cls.calls.append(image)
-        return "data:image/png;base64,encoded"
+import deepdoc.parser.mineru_parser as mineru_parser_module
+import rag.flow.parser.parser as parser_module
 
 
-def _load_pdf_markdown_renderer() -> MarkdownRenderer:
-    """Isolate the production PDF markdown loop for unit testing."""
-    repo_root = Path(__file__).resolve().parents[5]
-    module_path = repo_root / "rag" / "flow" / "parser" / "parser.py"
-    module_ast = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
-    parser_class = next(node for node in module_ast.body if isinstance(node, ast.ClassDef) and node.name == "Parser")
-    pdf_method = next(node for node in parser_class.body if isinstance(node, ast.FunctionDef) and node.name == "_pdf")
-    markdown_loop = next(
-        node
-        for node in ast.walk(pdf_method)
-        if isinstance(node, ast.For)
-        and isinstance(node.iter, ast.Name)
-        and node.iter.id == "bboxes"
-        and any(isinstance(child, ast.Constant) and isinstance(child.value, str) and "![Image]" in child.value for child in ast.walk(node))
+def _build_flow_parser(monkeypatch, pdf_parser):
+    monkeypatch.setattr(parser_module.TenantModelService, "get_by_id", Mock(return_value=(False, None)))
+    monkeypatch.setattr(parser_module, "resolve_model_config", Mock(return_value={"llm_name": "mineru-model"}))
+    monkeypatch.setattr(parser_module, "LLMBundle", Mock(return_value=SimpleNamespace(mdl=pdf_parser)))
+    monkeypatch.setattr(parser_module, "enhance_media_sections_with_vision", lambda *_args, **_kwargs: None)
+
+    parser = object.__new__(parser_module.Parser)
+    parser._param = SimpleNamespace(
+        setups={
+            "pdf": {
+                "parse_method": "MinerU",
+                "mineru_llm_name": "mineru-model",
+                "lang": "English",
+                "output_format": "markdown",
+                "flatten_media_to_text": False,
+                "remove_toc": False,
+                "remove_header_footer": False,
+            }
+        },
+        outputs={},
     )
-
-    renderer = ast.FunctionDef(
-        name="render",
-        args=ast.arguments(
-            posonlyargs=[],
-            args=[ast.arg(arg="bboxes"), ast.arg(arg="name"), ast.arg(arg="parse_method")],
-            kwonlyargs=[],
-            kw_defaults=[],
-            defaults=[],
-        ),
-        body=[
-            ast.Assign(targets=[ast.Name(id="mkdn", ctx=ast.Store())], value=ast.Constant(value="")),
-            copy.deepcopy(markdown_loop),
-            ast.Return(value=ast.Name(id="mkdn", ctx=ast.Load())),
-        ],
-        decorator_list=[],
-        type_params=[],
-    )
-    function_module = ast.Module(body=[renderer], type_ignores=[])
-    ast.fix_missing_locations(function_module)
-
-    namespace: dict[str, object] = {"VLM": _FakeVLM, "logging": logging}
-    exec(compile(function_module, str(module_path), "exec"), namespace)
-    return cast(MarkdownRenderer, namespace["render"])
+    parser._canvas = SimpleNamespace(_tenant_id="tenant-id", _language="English")
+    parser.callback = Mock()
+    return parser
 
 
-def test_pdf_markdown_skips_figures_without_images_and_logs(caplog) -> None:
-    render = _load_pdf_markdown_renderer()
-    _FakeVLM.calls = []
-    bboxes: list[dict[str, object]] = [
-        {"layout_type": "figure", "text": "missing image key"},
-        {"layout_type": "figure", "image": None, "text": "null image"},
-        {"layout_type": "text", "text": "Document body"},
+def test_pdf_mineru_markdown_preserves_source_order_and_empty_media_return(monkeypatch) -> None:
+    mineru_parser = mineru_parser_module.MinerUParser()
+    outputs = [
+        {"type": mineru_parser_module.MinerUContentType.TEXT, "text": "Before", "page_idx": 0, "bbox": [5, 5, 45, 15]},
+        {
+            "type": mineru_parser_module.MinerUContentType.TABLE,
+            "table_body": "<table><tr><td>Cell</td></tr></table>",
+            "table_caption": [],
+            "table_footnote": [],
+            "page_idx": 0,
+            "bbox": [5, 20, 45, 40],
+        },
+        {
+            "type": mineru_parser_module.MinerUContentType.IMAGE,
+            "image_caption": ["Figure caption"],
+            "image_footnote": ["Figure footnote"],
+            "page_idx": 0,
+            "bbox": [5, 45, 45, 70],
+        },
+        {"type": mineru_parser_module.MinerUContentType.TEXT, "text": "After", "page_idx": 0, "bbox": [5, 75, 45, 85]},
     ]
 
+    def render_pages(_pdf, zoomin=1, page_from=0, page_to=mineru_parser_module.MAXIMUM_PAGE_NUMBER, callback=None):
+        mineru_parser.page_from = page_from
+        mineru_parser.page_to = page_to
+        mineru_parser.page_images = [Image.new("RGB", (100, 100), "white")]
+        mineru_parser.page_sizes = {0: (100, 100)}
+
+    monkeypatch.setattr(mineru_parser_module, "extract_pdf_outlines", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(mineru_parser, "__images__", render_pages)
+    monkeypatch.setattr(mineru_parser, "_run_mineru", lambda _input_path, output_dir, _options, **_kwargs: output_dir)
+    monkeypatch.setattr(mineru_parser, "_read_output", lambda *_args, **_kwargs: outputs)
+
+    parse_results = []
+    parse_pdf = mineru_parser.parse_pdf
+
+    def record_parse_result(*args, **kwargs):
+        result = parse_pdf(*args, **kwargs)
+        parse_results.append(result)
+        return result
+
+    monkeypatch.setattr(mineru_parser, "parse_pdf", record_parse_result)
+    monkeypatch.setattr(parser_module.VLM, "image2base64", staticmethod(lambda _image: "data:image/png;base64,figure"))
+    parser = _build_flow_parser(monkeypatch, mineru_parser)
+
+    parser._pdf("ordered.pdf", b"%PDF-1.4 fake", file={"id": "document-id"})
+
+    assert parse_results and parse_results[0][1] == []
+    assert parser.output("markdown") == ("Before\n<table><tr><td>Cell</td></tr></table>\n\n![Image](data:image/png;base64,figure)\nFigure caption\nFigure footnote\nAfter\n")
+
+
+def test_pdf_markdown_preserves_text_when_figure_image_is_unavailable(monkeypatch, caplog) -> None:
+    class TextOnlyMinerUParser:
+        outlines = []
+
+        @staticmethod
+        def parse_pdf(**_kwargs):
+            return [
+                ("Caption without image", "image", ""),
+                ("", "image", ""),
+                ("Document body", "text", ""),
+            ], []
+
+        @staticmethod
+        def extract_positions(_position_tag):
+            return []
+
+        @staticmethod
+        def crop(_position_tag, _zoomin):
+            return None
+
+    image_calls = []
+    monkeypatch.setattr(parser_module.VLM, "image2base64", staticmethod(lambda image: image_calls.append(image) or "unused"))
+    parser = _build_flow_parser(monkeypatch, TextOnlyMinerUParser())
+
     with caplog.at_level(logging.WARNING):
-        markdown = render(bboxes, "document.pdf", "MinerU")
+        parser._pdf("document.pdf", b"%PDF-1.4 fake")
 
-    warnings = [record.getMessage() for record in caplog.records if "Skipping figure in markdown output" in record.getMessage()]
-    assert markdown == "Document body\n"
-    assert _FakeVLM.calls == []
-    assert len(warnings) == 2
-    assert all("document.pdf" in message and "parse_method=MinerU" in message for message in warnings)
-
-
-def test_pdf_markdown_renders_available_figure_images() -> None:
-    render = _load_pdf_markdown_renderer()
-    image = object()
-    _FakeVLM.calls = []
-
-    markdown = render([{"layout_type": "figure", "image": image}], "document.pdf", "MinerU")
-
-    assert markdown == "\n![Image](data:image/png;base64,encoded)"
-    assert _FakeVLM.calls == [image]
+    assert parser.output("markdown") == "Caption without image\nDocument body\n"
+    assert image_calls == []
+    warnings = [record.getMessage() for record in caplog.records if "Skipping empty figure in markdown output" in record.getMessage()]
+    assert warnings == ["Skipping empty figure in markdown output for document.pdf (parse_method=MinerU)."]
