@@ -23,6 +23,55 @@ from rag.utils.web_search_conn import create_web_search_provider
 from timeit import default_timer as timer
 
 
+class _CanonKey:
+    """Wraps a canonicalized structure so it can never collide with an
+    unrelated plain hashable value (e.g. a string equal to another value's
+    repr())."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key):
+        self._key = key
+
+    def __eq__(self, other):
+        return isinstance(other, _CanonKey) and self._key == other._key
+
+    def __hash__(self):
+        return hash(self._key)
+
+
+def _canonicalize(value):
+    """Recursively convert JSON-like unhashable values (dict/list/set) into an
+    equality-preserving hashable form: dict equality ignores key order, list
+    equality doesn't. Distinct types that are never equal to each other in
+    Python (list vs. tuple) get distinct tags; types that compare equal by
+    value (set vs. frozenset) share one."""
+    if isinstance(value, dict):
+        return ("__dict__", frozenset((k, _canonicalize(v)) for k, v in value.items()))
+    if isinstance(value, list):
+        return ("__list__", tuple(_canonicalize(v) for v in value))
+    if isinstance(value, tuple):
+        return ("__tuple__", tuple(_canonicalize(v) for v in value))
+    if isinstance(value, (set, frozenset)):
+        return ("__set__", frozenset(_canonicalize(v) for v in value))
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return ("__repr__", repr(value))
+
+
+def _hashable_key(value):
+    """Return a value usable as a set/dict key, falling back to a recursive
+    canonicalization for unhashable (malformed) provenance values instead of
+    raising TypeError."""
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return _CanonKey(_canonicalize(value))
+
+
 class TreeStructuredQueryDecompositionRetrieval:
     def __init__(
         self,
@@ -79,15 +128,19 @@ class TreeStructuredQueryDecompositionRetrieval:
                     chunk_info[k] = kbinfos[k]
             else:
                 # Merge newly retrieved information, avoiding duplicates
-                cids = [c["chunk_id"] for c in chunk_info["chunks"]]
+                cids = {_hashable_key(c["chunk_id"]) for c in chunk_info["chunks"]}
                 for c in kbinfos["chunks"]:
-                    if c["chunk_id"] not in cids:
+                    key = _hashable_key(c["chunk_id"])
+                    if key not in cids:
                         chunk_info["chunks"].append(c)
+                        cids.add(key)
 
-                dids = [d["doc_id"] for d in chunk_info["doc_aggs"]]
+                dids = {_hashable_key(d["doc_id"]) for d in chunk_info["doc_aggs"]}
                 for d in kbinfos["doc_aggs"]:
-                    if d["doc_id"] not in dids:
+                    key = _hashable_key(d["doc_id"])
+                    if key not in dids:
                         chunk_info["doc_aggs"].append(d)
+                        dids.add(key)
 
                 chunk_info["total"] = chunk_info.get("total", 0) + kbinfos.get("total", 0)
 
