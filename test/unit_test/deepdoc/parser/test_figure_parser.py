@@ -227,6 +227,26 @@ def test_vision_figure_parser_passes_dataset_language_to_prompt(
 
 
 @pytest.mark.p1
+def test_vision_figure_parser_preserves_empty_and_mixed_positions(monkeypatch):
+    module, _ = _load_figure_parser(monkeypatch)
+    image_without_position = object()
+    positioned_image = object()
+    positioned = [(3, 10, 20, 30, 40)]
+    parser = module.VisionFigureParser(
+        vision_model=object(),
+        figures_data=[
+            ((image_without_position, ["without position"]), []),
+            ((positioned_image, ["positioned"]), positioned),
+        ],
+    )
+
+    assert parser._assemble() == [
+        ((image_without_position, ["without position"]), []),
+        ((positioned_image, ["positioned"]), positioned),
+    ]
+
+
+@pytest.mark.p1
 @pytest.mark.parametrize(
     "wrapper_name",
     [

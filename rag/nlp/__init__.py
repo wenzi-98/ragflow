@@ -475,14 +475,14 @@ def tokenize_table(tbls, doc, eng, batch_size=10, language="English"):
     res = []
     # add tables
     for (img, rows), poss in tbls:
-        if not rows:
-            continue
         if isinstance(rows, str):
+            if not rows.strip() and img is None:
+                continue
             d = copy.deepcopy(doc)
             tokenize(d, rows, eng, language=language)
             d["content_with_weight"] = rows
             d["doc_type_kwd"] = "table"
-            if img:
+            if img is not None:
                 d["image"] = img
                 if d["content_with_weight"].find("<tr>") < 0:
                     d["doc_type_kwd"] = "image"
@@ -490,18 +490,23 @@ def tokenize_table(tbls, doc, eng, batch_size=10, language="English"):
                 add_positions(d, poss)
             res.append(d)
             continue
+        normalized_rows = [str(row).strip() for row in rows if str(row or "").strip()]
+        if not normalized_rows:
+            if img is None:
+                continue
+            normalized_rows = [""]
         lang_key = (language or "English").strip().lower()
         de = "； " if lang_key in {"chinese", "japanese"} else "; "
-        for i in range(0, len(rows), batch_size):
+        for i in range(0, len(normalized_rows), batch_size):
             d = copy.deepcopy(doc)
-            r = de.join(rows[i : i + batch_size])
+            r = de.join(normalized_rows[i : i + batch_size])
             tokenize(d, r, eng, language=language)
-            d["doc_type_kwd"] = "table"
-            if img:
+            # List payloads represent figures across all current parser producers.
+            d["doc_type_kwd"] = "image"
+            if img is not None:
                 d["image"] = img
-                if d["content_with_weight"].find("<tr>") < 0:
-                    d["doc_type_kwd"] = "image"
-            add_positions(d, poss)
+            if poss:
+                add_positions(d, poss)
             res.append(d)
     return res
 
@@ -884,6 +889,11 @@ def append_context2table_image4pdf(sections: list, tabls: list, table_context_si
     res = []
     contexts = []
     for (img, tb), poss in tabls:
+        if not poss:
+            # Keep searchable media when no reliable PDF position is available.
+            contexts.append(("", ""))
+            res.append(((img, tb), poss))
+            continue
         page, left, right, top, bott = poss[0]
         _page, _left, _right, _top, _bott = poss[-1]
         if isinstance(tb, list):
