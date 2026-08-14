@@ -15,38 +15,18 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import random
 import re
 from functools import partial
 
-import logging
-
 import numpy as np
 from PIL import Image
 
-from api.db.services.file2document_service import File2DocumentService
-from api.db.services.file_service import FileService
-from api.db.services.llm_service import LLMBundle
-from api.db.joint_services.tenant_model_service import (
-    ensure_mineru_from_env,
-    ensure_opendataloader_from_env,
-    ensure_paddleocr_from_env,
-    get_first_provider_model_name,
-    resolve_model_config,
-    get_tenant_default_model_by_type,
-)
-from api.db.services.tenant_model_instance_service import TenantModelInstanceService
-from api.db.services.tenant_model_provider_service import TenantModelProviderService
-from api.db.services.tenant_model_service import TenantModelService
 from common import settings
 from common.constants import LLMType
 from common.misc_utils import get_uuid, thread_pool_exec
-from deepdoc.parser import ExcelParser, HtmlParser, TxtParser
-from deepdoc.parser.docling_parser import DoclingParser
-from deepdoc.parser.pdf_parser import PlainParser, RAGFlowPdfParser, VisionParser
-from deepdoc.parser.tcadp_parser import TCADPParser
-from rag.app.naive import Docx
 from rag.flow.base import ProcessBase, ProcessParamBase
 from rag.flow.parser.pdf_chunk_metadata import (
     extract_pdf_positions,
@@ -56,16 +36,86 @@ from rag.flow.parser.pdf_chunk_metadata import (
 from rag.flow.parser.schema import ParserFromUpstream
 from rag.flow.parser.utils import (
     enhance_media_sections_with_vision,
-    extract_word_outlines,
     extract_docx_header_footer_texts,
+    extract_word_outlines,
     remove_header_footer_docx_sections,
     remove_header_footer_html_blob,
     remove_toc,
     remove_toc_pdf,
     remove_toc_word,
 )
-from rag.llm.cv_model import Base as VLM
 from rag.utils.base64_image import image2id
+
+_LOGGER = logging.getLogger(__name__)
+_PDF_PROVIDER_PARSE_METHODS = {
+    "@mineru": "MinerU",
+    "@paddleocr": "PaddleOCR",
+    "@somark": "SoMark",
+    "@mistral ocr": "Mistral OCR",
+}
+_PDF_PARSE_METHODS_WITHOUT_MODEL_LOOKUP = {
+    "deepdoc",
+    "plain_text",
+    "mineru",
+    "docling",
+    "opendataloader",
+    "somark",
+    "mistral ocr",
+    "tcadp parser",
+    "paddleocr",
+}
+
+
+def _resolve_pdf_parse_method(raw_parse_method):
+    parse_method = raw_parse_method or ""
+    if not isinstance(raw_parse_method, str):
+        return parse_method, None
+
+    lowered = raw_parse_method.lower()
+    for suffix, provider_method in _PDF_PROVIDER_PARSE_METHODS.items():
+        if lowered.endswith(suffix):
+            _LOGGER.debug("Using configured PDF provider parser %s without tenant-model lookup.", provider_method)
+            return provider_method, raw_parse_method
+
+    if not raw_parse_method or lowered in _PDF_PARSE_METHODS_WITHOUT_MODEL_LOOKUP:
+        return parse_method, None
+
+    from api.db.services.tenant_model_service import TenantModelService
+
+    exist, model_obj = TenantModelService.get_by_id(raw_parse_method)
+    if not exist:
+        _LOGGER.debug("PDF parser reference did not resolve to a tenant model; using the configured method.")
+        return parse_method, None
+
+    from api.db.services.tenant_model_instance_service import TenantModelInstanceService
+    from api.db.services.tenant_model_provider_service import TenantModelProviderService
+
+    provider_ok, provider_obj = TenantModelProviderService.get_by_id(model_obj.provider_id)
+    instance_ok, instance_obj = TenantModelInstanceService.get_by_id(model_obj.instance_id)
+    if not provider_ok or not instance_ok:
+        _LOGGER.debug("PDF parser tenant model is missing provider or instance metadata; using the configured method.")
+        return parse_method, None
+
+    resolved_method = f"{model_obj.model_name}@{instance_obj.instance_name}@{provider_obj.provider_name}"
+    lowered = resolved_method.lower()
+    for suffix, provider_method in _PDF_PROVIDER_PARSE_METHODS.items():
+        if lowered.endswith(suffix):
+            _LOGGER.debug("Resolved PDF parser tenant model to provider parser %s.", provider_method)
+            return provider_method, resolved_method
+    _LOGGER.debug("PDF parser tenant model did not match a supported provider parser; using the configured method.")
+    return resolved_method, None
+
+
+def _fetch_source_blob(from_upstream, canvas):
+    if canvas._doc_id:
+        from api.db.services.file2document_service import File2DocumentService
+
+        bucket, name = File2DocumentService.get_storage_address(doc_id=canvas._doc_id)
+        return settings.STORAGE_IMPL.get(bucket, name)
+
+    from api.db.services.file_service import FileService
+
+    return FileService.get_blob(from_upstream.file["created_by"], from_upstream.file["id"])
 
 
 class ParserParam(ProcessParamBase):
@@ -339,43 +389,12 @@ class Parser(ProcessBase):
         flatten_media_to_text = conf.get("flatten_media_to_text")
         pdf_parser = None
 
-        # Normalize parser selection and optional provider-specific model name.
-        raw_parse_method = conf.get("parse_method", "")
-        # If raw_parse_method is a tenant_model ID, resolve it to
-        # model_name@instance_name@provider_name so the provider-specific
-        # branches below can match the per-provider suffix.
-        if isinstance(raw_parse_method, str) and raw_parse_method:
-            exist, model_obj = TenantModelService.get_by_id(raw_parse_method)
-            if exist:
-                provider_ok, provider_obj = TenantModelProviderService.get_by_id(model_obj.provider_id)
-                instance_ok, instance_obj = TenantModelInstanceService.get_by_id(model_obj.instance_id)
-                if provider_ok and instance_ok:
-                    raw_parse_method = f"{model_obj.model_name}@{instance_obj.instance_name}@{provider_obj.provider_name}"
-
-        parser_model_name = None
-        parse_method = raw_parse_method
-        parse_method = parse_method or ""
-        if isinstance(raw_parse_method, str):
-            lowered = raw_parse_method.lower()
-            if lowered.endswith("@mineru"):
-                parser_model_name = raw_parse_method
-                parse_method = "MinerU"
-            elif lowered.endswith("@paddleocr"):
-                parser_model_name = raw_parse_method
-                parse_method = "PaddleOCR"
-            elif lowered.endswith("@somark"):
-                # Keep the full 3-segment ``<llm_name>@<instance_name>@<provider>``
-                # form produced by the new Tenant LLM Provider UI (#14595);
-                # ``resolve_model_config`` -> ``split_model_name``
-                # downstream requires all three segments.
-                parser_model_name = raw_parse_method
-                parse_method = "SoMark"
-            elif lowered.endswith("@mistral ocr"):
-                parser_model_name = raw_parse_method
-                parse_method = "Mistral OCR"
+        parse_method, parser_model_name = _resolve_pdf_parse_method(conf.get("parse_method", ""))
 
         # DeepDOC returns structured page boxes directly.
         if parse_method.lower() == "deepdoc":
+            from deepdoc.parser.pdf_parser import RAGFlowPdfParser
+
             pdf_parser = RAGFlowPdfParser()
             bboxes = pdf_parser.parse_into_bboxes(blob, callback=self.callback)
             if conf.get("enable_multi_column"):
@@ -383,6 +402,8 @@ class Parser(ProcessBase):
 
         # Plain text only keeps extracted text lines.
         elif parse_method.lower() == "plain_text":
+            from deepdoc.parser.pdf_parser import PlainParser
+
             pdf_parser = PlainParser()
             lines, _ = pdf_parser(blob)
             bboxes = [{"text": t, "layout_type": "text"} for t, _ in lines]
@@ -390,6 +411,8 @@ class Parser(ProcessBase):
         # MinerU/PaddleOCR/Docling/TCADP all return line-like sections that need
         # to be converted into the shared bbox-like structure used below.
         elif parse_method.lower() == "mineru":
+            from api.db.joint_services.tenant_model_service import ensure_mineru_from_env, get_first_provider_model_name, resolve_model_config
+            from api.db.services.llm_service import LLMBundle
 
             def resolve_mineru_llm_name():
                 configured = parser_model_name or conf.get("mineru_llm_name")
@@ -437,6 +460,8 @@ class Parser(ProcessBase):
                 bboxes.append(box)
 
         elif parse_method.lower() == "docling":
+            from deepdoc.parser.docling_parser import DoclingParser
+
             pdf_parser = DoclingParser(docling_server_url=os.environ.get("DOCLING_SERVER_URL", ""))
             lines, _ = pdf_parser.parse_pdf(
                 filepath=name,
@@ -464,6 +489,8 @@ class Parser(ProcessBase):
                 bboxes.append(box)
 
         elif parse_method.lower() == "opendataloader":
+            from api.db.joint_services.tenant_model_service import ensure_opendataloader_from_env, get_first_provider_model_name, resolve_model_config
+            from api.db.services.llm_service import LLMBundle
 
             def resolve_opendataloader_llm_name():
                 configured = parser_model_name or conf.get("opendataloader_llm_name")
@@ -524,6 +551,8 @@ class Parser(ProcessBase):
                 bboxes.append(box)
 
         elif parse_method.lower() == "somark":
+            from api.db.joint_services.tenant_model_service import resolve_model_config
+            from api.db.services.llm_service import LLMBundle
 
             def resolve_somark_llm_name():
                 configured = parser_model_name or conf.get("somark_llm_name")
@@ -570,6 +599,8 @@ class Parser(ProcessBase):
                 bboxes.append(box)
 
         elif parse_method.lower() == "mistral ocr":
+            from api.db.joint_services.tenant_model_service import resolve_model_config
+            from api.db.services.llm_service import LLMBundle
 
             def resolve_mistral_ocr_llm_name():
                 configured = parser_model_name or conf.get("mistral_ocr_llm_name")
@@ -616,6 +647,8 @@ class Parser(ProcessBase):
                 bboxes.append(box)
 
         elif parse_method.lower() == "tcadp parser":
+            from deepdoc.parser.tcadp_parser import TCADPParser
+
             # ADP is a document parsing tool using Tencent Cloud API
             table_result_type = conf.get("table_result_type", "1")
             markdown_image_response_type = conf.get("markdown_image_response_type", "1")
@@ -654,6 +687,8 @@ class Parser(ProcessBase):
                     bboxes.append({"text": section, "layout_type": "text"})
 
         elif parse_method.lower() == "paddleocr":
+            from api.db.joint_services.tenant_model_service import ensure_paddleocr_from_env, get_first_provider_model_name, resolve_model_config
+            from api.db.services.llm_service import LLMBundle
 
             def resolve_paddleocr_llm_name():
                 configured = parser_model_name or conf.get("paddleocr_llm_name")
@@ -700,6 +735,10 @@ class Parser(ProcessBase):
                 bboxes.append(box)
         # Vision parser treats each page as a large image block.
         else:
+            from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type, resolve_model_config
+            from api.db.services.llm_service import LLMBundle
+            from deepdoc.parser.pdf_parser import RAGFlowPdfParser, VisionParser
+
             if conf.get("parse_method"):
                 vision_model_config = resolve_model_config(self._canvas._tenant_id, LLMType.VISION, conf["parse_method"])
             else:
@@ -782,6 +821,8 @@ class Parser(ProcessBase):
             normalize_pdf_items_metadata(bboxes)
             self.set_output("json", bboxes)
         if conf.get("output_format") == "markdown":
+            from rag.llm.cv_model import Base as VLM
+
             mkdn = ""
             for b in bboxes:
                 if b.get("layout_type", "") == "title":
@@ -803,6 +844,8 @@ class Parser(ProcessBase):
 
         # Handle TCADP parser
         if parse_method.lower() == "tcadp parser":
+            from deepdoc.parser.tcadp_parser import TCADPParser
+
             table_result_type = conf.get("table_result_type", "1")
             markdown_image_response_type = conf.get("markdown_image_response_type", "1")
             tcadp_parser = TCADPParser(
@@ -875,6 +918,8 @@ class Parser(ProcessBase):
                 self.set_output("markdown", md_content)
         else:
             # Default DeepDOC parser
+            from deepdoc.parser import ExcelParser
+
             spreadsheet_parser = ExcelParser()
             if conf.get("output_format") == "html":
                 htmls = spreadsheet_parser.html(blob, 1000000000)
@@ -942,6 +987,8 @@ class Parser(ProcessBase):
             self.callback(0.8, "Finish parsing.")
             return
 
+        from rag.app.naive import Docx
+
         docx_parser = Docx()
 
         # Extract heading-based outlines for metadata and TOC removal.
@@ -1006,6 +1053,8 @@ class Parser(ProcessBase):
 
         # Handle TCADP parser
         if parse_method.lower() == "tcadp parser":
+            from deepdoc.parser.tcadp_parser import TCADPParser
+
             table_result_type = conf.get("table_result_type", "1")
             markdown_image_response_type = conf.get("markdown_image_response_type", "1")
             tcadp_parser = TCADPParser(
@@ -1125,6 +1174,8 @@ class Parser(ProcessBase):
 
     def _code(self, name, blob, **kwargs):
         """Parse text and source code files as plain text chunks."""
+        from deepdoc.parser import TxtParser
+
         self.callback(random.randint(1, 5) / 100.0, "Start to work on a text or code file.")
         conf = self._param.setups["text&code"]
         self.set_output("output_format", conf["output_format"])
@@ -1144,6 +1195,8 @@ class Parser(ProcessBase):
 
     def _html(self, name, blob, **kwargs):
         """Parse HTML files into text/json sections."""
+        from deepdoc.parser import HtmlParser
+
         self.callback(random.randint(1, 5) / 100.0, "Start to work on an HTML document.")
         conf = self._param.setups["html"]
         self.set_output("output_format", conf["output_format"])
@@ -1176,6 +1229,9 @@ class Parser(ProcessBase):
             bxs = ocr(np.array(img))  # return boxes and recognize result
             txt = "\n".join([t[0] for _, t in bxs if t[0]])
         else:
+            from api.db.joint_services.tenant_model_service import resolve_model_config
+            from api.db.services.llm_service import LLMBundle
+
             lang = conf["lang"]
             # use VLM to describe the picture
             cv_model_config = resolve_model_config(self._canvas.get_tenant_id(), LLMType.VISION, conf["parse_method"])
@@ -1204,6 +1260,9 @@ class Parser(ProcessBase):
         import os
         import tempfile
 
+        from api.db.joint_services.tenant_model_service import resolve_model_config
+        from api.db.services.llm_service import LLMBundle
+
         self.callback(random.randint(1, 5) / 100.0, "Start to work on an audio.")
 
         conf = self._param.setups["audio"]
@@ -1222,6 +1281,9 @@ class Parser(ProcessBase):
 
     def _video(self, name, blob, **kwargs):
         """Parse video files with image-to-text models."""
+        from api.db.joint_services.tenant_model_service import resolve_model_config
+        from api.db.services.llm_service import LLMBundle
+
         self.callback(random.randint(1, 5) / 100.0, "Start to work on an video.")
 
         conf = self._param.setups["video"]
@@ -1413,11 +1475,7 @@ class Parser(ProcessBase):
             return
 
         name = from_upstream.name
-        if self._canvas._doc_id:
-            b, n = File2DocumentService.get_storage_address(doc_id=self._canvas._doc_id)
-            blob = settings.STORAGE_IMPL.get(b, n)
-        else:
-            blob = FileService.get_blob(from_upstream.file["created_by"], from_upstream.file["id"])
+        blob = _fetch_source_blob(from_upstream, self._canvas)
 
         done = False
         for p_type, conf in self._param.setups.items():
