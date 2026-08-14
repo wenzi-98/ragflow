@@ -395,6 +395,9 @@ func (s *PipelineExecutor) recordPipelineLog(ctx context.Context, db *gorm.DB, d
 	if err := json.Unmarshal([]byte(dsl), &dslMap); err != nil {
 		dslMap = entity.JSONMap{"raw": dsl}
 	}
+	// source_from stores the source key only (e.g. "rss"); the document
+	// source_type carries "<source>/<connector_id>" for synced documents.
+	sourceFrom, _, _ := strings.Cut(s.taskCtx.Doc.SourceType, "/")
 	log := &entity.PipelineOperationLog{
 		ID:              utility.GenerateUUID(),
 		TenantID:        s.Tenant().ID,
@@ -407,7 +410,7 @@ func (s *PipelineExecutor) recordPipelineLog(ctx context.Context, db *gorm.DB, d
 		DocumentName:    *s.Doc().Name,
 		DocumentSuffix:  s.taskCtx.Doc.Suffix,
 		DocumentType:    s.taskCtx.Doc.Type,
-		SourceFrom:      s.taskCtx.Doc.SourceType,
+		SourceFrom:      sourceFrom,
 		OperationStatus: status,
 	}
 	if err := s.logCreateFunc(ctx, db, log); err != nil {
