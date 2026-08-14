@@ -156,18 +156,6 @@ def by_mineru(
                 ocr_model = LLMBundle(tenant_id=tenant_id, model_config=ocr_model_config, lang=lang)
                 pdf_parser = ocr_model.mdl
 
-                # Closes #14869: when the tenant has a VISION model
-                # configured, let the MinerU parser enrich image chunks with
-                # VLM-generated semantic descriptions (parity with deepdoc's
-                # VisionFigureParser). Best-effort — fall back silently if
-                # no vision model is available.
-                if "vision_model" not in kwargs:
-                    try:
-                        vision_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.VISION)
-                        kwargs["vision_model"] = LLMBundle(tenant_id=tenant_id, model_config=vision_model_config, lang=lang)
-                    except Exception as vlm_err:
-                        logging.info(f"[MinerU] no VISION model for tenant; skipping image VLM enhancement: {vlm_err}")
-
                 sections, tables = pdf_parser.parse_pdf(
                     filepath=filename,
                     binary=binary,
@@ -178,6 +166,20 @@ def by_mineru(
                     page_to=min(to_page, MAXIMUM_PAGE_NUMBER),
                     **kwargs,
                 )
+                # Closes #14869: keep MinerU figure chunks searchable when the
+                # tenant has a VISION model. General/raw enriches here because it
+                # has no later media pass; Manual and Paper use their own wrappers
+                # so the same image is never sent to VLM twice.
+                if (parse_method or "raw").lower() == "raw":
+                    tables = vision_figure_parser_pdf_wrapper(
+                        tbls=tables,
+                        sections=sections,
+                        callback=callback,
+                        tenant_id=tenant_id,
+                        lang=lang,
+                        section_page_offset=from_page,
+                        **kwargs,
+                    )
                 return sections, tables, pdf_parser
             except Exception as e:
                 logging.error(f"Failed to parse pdf via LLMBundle MinerU ({mineru_llm_name}): {e}")
@@ -1090,7 +1092,12 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
             return []
 
         if table_context_size or image_context_size:
-            tables = append_context2table_image4pdf(sections, tables, image_context_size)
+            tables = append_context2table_image4pdf(
+                sections,
+                tables,
+                image_context_size,
+                section_page_offset=from_page if name == "mineru" else 0,
+            )
 
         if name in ["tcadp", "docling", "mineru", "paddleocr", "opendataloader", "somark", "mistral ocr"]:
             if int(parser_config.get("chunk_token_num", 0)) <= 0:

@@ -185,6 +185,7 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
             sections=sections,
             callback=callback,
             lang=lang,
+            section_page_offset=from_page if name == "mineru" else 0,
             **kwargs,
         )
         paper["tables"] = tbls

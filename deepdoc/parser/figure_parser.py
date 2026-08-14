@@ -114,7 +114,7 @@ def vision_figure_parser_figure_xlsx_wrapper(images, callback=None, lang="Englis
     return tbls
 
 
-def vision_figure_parser_pdf_wrapper(tbls, callback=None, lang="English", **kwargs):
+def vision_figure_parser_pdf_wrapper(tbls, callback=None, lang="English", section_page_offset: int = 0, **kwargs):
     lang = _normalize_vision_language(lang)
     if not tbls:
         return []
@@ -140,6 +140,7 @@ def vision_figure_parser_pdf_wrapper(tbls, callback=None, lang="English", **kwar
                 figures_data,
                 context_size,
                 return_context=True,
+                section_page_offset=section_page_offset,
             )
         try:
             docx_vision_parser = VisionFigureParser(
@@ -223,7 +224,7 @@ class VisionFigureParser:
         self.context_size = max(0, int(kwargs.get("context_size", 0) or 0))
         self._extract_figures_info(figures_data)
         assert len(self.figures) == len(self.descriptions)
-        assert not self.positions or (len(self.figures) == len(self.positions))
+        assert len(self.figures) == len(self.positions)
 
     def _extract_figures_info(self, figures_data):
         self.figures = []
@@ -231,8 +232,10 @@ class VisionFigureParser:
         self.positions = []
 
         for item in figures_data:
-            # position
-            if len(item) == 2 and isinstance(item[0], tuple) and len(item[0]) == 2 and isinstance(item[1], list) and isinstance(item[1][0], tuple) and len(item[1][0]) == 5:
+            has_position_shape = (
+                len(item) == 2 and isinstance(item[0], tuple) and len(item[0]) == 2 and isinstance(item[1], list) and (not item[1] or (isinstance(item[1][0], tuple) and len(item[1][0]) == 5))
+            )
+            if has_position_shape:
                 img_desc = item[0]
                 img = ensure_pil_image(img_desc[0])
                 if img is None:
@@ -248,14 +251,14 @@ class VisionFigureParser:
                 assert len(item) == 2 and isinstance(item[1], list), f"Unexpected form of figure data: get {len(item)=}, {item=}"
                 self.figures.append(img)
                 self.descriptions.append(item[1])
+                self.positions.append(None)
 
     def _assemble(self):
         self.assembled = []
-        self.has_positions = len(self.positions) != 0
         for i in range(len(self.figures)):
             figure = self.figures[i]
             desc = self.descriptions[i]
-            pos = self.positions[i] if self.has_positions else None
+            pos = self.positions[i]
 
             figure_desc = (figure, desc)
 

@@ -38,7 +38,7 @@ def _call_name(call):
     [
         ("rag/app/book.py", 1),
         ("rag/app/manual.py", 2),
-        ("rag/app/naive.py", 2),
+        ("rag/app/naive.py", 3),
         ("rag/app/one.py", 1),
         ("rag/app/paper.py", 1),
         ("rag/app/table.py", 1),

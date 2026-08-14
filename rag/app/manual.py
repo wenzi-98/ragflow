@@ -240,14 +240,18 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
             sec_ids.append(sid)
 
         sections = [(txt, sec_ids[i], poss) for i, (txt, _, poss) in enumerate(sections)]
-        for (img, rows), poss in tbls:
-            if not rows:
-                continue
-            sections.append((rows if isinstance(rows, str) else rows[0], -1, [(p[0] + 1 - from_page, p[1], p[2], p[3], p[4]) for p in poss]))
+        if name != "mineru":
+            for (img, rows), poss in tbls:
+                # Unpositioned media remains in tbls and is tokenized independently.
+                if not rows or not poss:
+                    continue
+                sections.append((rows if isinstance(rows, str) else rows[0], -1, [(p[0] + 1 - from_page, p[1], p[2], p[3], p[4]) for p in poss]))
 
         def tag(pn, left, right, top, bottom):
             if pn + left + right + top + bottom == 0:
                 return ""
+            if name == "mineru":
+                pn += 1
             return "@@{}\t{:.1f}\t{:.1f}\t{:.1f}\t{:.1f}##".format(pn, left, right, top, bottom)
 
         chunks = []
@@ -269,6 +273,7 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
             sections=sections,
             callback=callback,
             lang=lang,
+            section_page_offset=from_page if name == "mineru" else 0,
             **kwargs,
         )
         res = tokenize_table(tbls, doc, eng, language=lang)

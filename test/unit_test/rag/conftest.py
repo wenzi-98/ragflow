@@ -31,6 +31,7 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
+import threading
 import types
 
 import pytest
@@ -70,6 +71,12 @@ def _make_pdf_parser_stub():
             return text
 
     pdf_parser.RAGFlowPdfParser = _StubPdfParser
+    pdf_parser.PlainParser = _StubPdfParser
+    pdf_parser.VisionParser = _StubPdfParser
+    pdf_parser.MAXIMUM_PAGE_NUMBER = 100000
+    pdf_parser.LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
+    if pdf_parser.LOCK_KEY_pdfplumber not in sys.modules:
+        sys.modules[pdf_parser.LOCK_KEY_pdfplumber] = threading.Lock()
     return pdf_parser
 
 

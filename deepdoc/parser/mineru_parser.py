@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from os import PathLike
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence, cast
 
 import numpy as np
 import pdfplumber
@@ -146,6 +146,11 @@ class MinerUParser(RAGFlowPdfParser):
         self.mineru_api = mineru_api.rstrip("/")
         self.mineru_server_url = mineru_server_url.rstrip("/")
         self.outlines = []
+        self.page_from = 0
+        self.page_to = MAXIMUM_PAGE_NUMBER
+        self.page_images: list[Image.Image] | None = None
+        self.page_sizes: dict[int, tuple[float, float]] = {}
+        self.total_page = 0
         self.logger = logging.getLogger(self.__class__.__name__)
 
     @staticmethod
@@ -202,11 +207,11 @@ class MinerUParser(RAGFlowPdfParser):
                     shutil.copyfileobj(src, dst)
 
     @staticmethod
-    def _is_http_endpoint_valid(url, timeout=5):
+    def _is_http_endpoint_valid(url: str, timeout: int = 5) -> bool:
         try:
             response = requests.head(url, timeout=timeout, allow_redirects=True)
-            return response.status_code in [200, 301, 302, 307, 308]
-        except Exception:
+            return response.status_code < 500
+        except requests.RequestException:
             return False
 
     @staticmethod
@@ -264,8 +269,14 @@ class MinerUParser(RAGFlowPdfParser):
             try:
                 server_ok = self._is_http_endpoint_valid(resolved_server)
                 self.logger.info(f"[MinerU] vlm-http-client server check reachable={server_ok} url={resolved_server}")
+                if not server_ok:
+                    reason = f"[MinerU] vlm-http-client server not accessible: {resolved_server}"
+                    self.logger.warning(reason)
+                    return False, reason
             except Exception as exc:
-                self.logger.warning(f"[MinerU] vlm-http-client server probe failed: {resolved_server}: {exc}")
+                reason = f"[MinerU] vlm-http-client server probe failed: {resolved_server}: {exc}"
+                self.logger.warning(reason)
+                return False, reason
 
         return True, reason
 
@@ -352,16 +363,31 @@ class MinerUParser(RAGFlowPdfParser):
             raise RuntimeError(f"[MinerU] api failed with exception {e}")
 
     def __images__(self, fnm, zoomin: int = 1, page_from=0, page_to=MAXIMUM_PAGE_NUMBER, callback=None):
+        """Render the requested PDF slice and cache dimensions by local page index."""
         self.page_from = page_from
         self.page_to = page_to
+        self.page_images = None
+        self.page_sizes = {}
+        self.total_page = 0
         try:
-            with pdfplumber.open(fnm) if isinstance(fnm, (str, PathLike)) else pdfplumber.open(BytesIO(fnm)) as pdf:
-                self.pdf = pdf
-                self.page_images = [p.to_image(resolution=72 * zoomin, antialias=True).original for _, p in enumerate(self.pdf.pages[page_from:page_to])]
-        except Exception as e:
-            self.page_images = None
-            self.total_page = 0
-            self.logger.exception(e)
+            with cast(threading.Lock, sys.modules[LOCK_KEY_pdfplumber]):
+                with pdfplumber.open(fnm) if isinstance(fnm, (str, PathLike)) else pdfplumber.open(BytesIO(fnm)) as pdf:
+                    self.pdf = pdf
+                    pages = self.pdf.pages[page_from:page_to]
+                    # MinerU restarts page_idx at zero after slicing, so all render
+                    # metadata remains local until a consumer emits global positions.
+                    self.page_sizes = {page_idx: (float(page.width), float(page.height)) for page_idx, page in enumerate(pages)}
+                    self.total_page = len(pages)
+                    self.page_images = [page.to_image(resolution=72 * zoomin, antialias=True).original for page in pages]
+        except Exception:
+            self.logger.exception("[MinerU] Failed to render PDF pages; using page metadata for bbox projection when available.")
+
+    def _get_page_size(self, page_idx: int) -> tuple[float, float] | None:
+        """Return the coordinate-space size for a sliced-document page index."""
+        if self.page_images and 0 <= page_idx < len(self.page_images):
+            width, height = self.page_images[page_idx].size
+            return float(width), float(height)
+        return self.page_sizes.get(page_idx)
 
     @staticmethod
     def _normalize_bbox(bbox):
@@ -373,20 +399,24 @@ class MinerUParser(RAGFlowPdfParser):
             top, bott = bott, top
         return x0, top, x1, bott
 
-    def _content_bbox_to_page_space(self, page_idx, bbox):
+    def _content_bbox_to_page_space(self, page_idx, bbox) -> tuple[float, float, float, float] | None:
         x0, top, x1, bott = self._normalize_bbox(bbox)
-        if hasattr(self, "page_images") and self.page_images and len(self.page_images) > page_idx:
-            page_width, page_height = self.page_images[page_idx].size
-            x0 = (x0 / 1000.0) * page_width
-            x1 = (x1 / 1000.0) * page_width
-            top = (top / 1000.0) * page_height
-            bott = (bott / 1000.0) * page_height
+        page_size = self._get_page_size(page_idx)
+        if page_size is None:
+            self.logger.warning("[MinerU] Missing page size for page_idx=%s; omitting bbox=%s", page_idx, bbox)
+            return None
+        page_width, page_height = page_size
+        x0 = (x0 / 1000.0) * page_width
+        x1 = (x1 / 1000.0) * page_width
+        top = (top / 1000.0) * page_height
+        bott = (bott / 1000.0) * page_height
         return x0, top, x1, bott
 
     def _middle_bbox_to_page_space(self, page_idx, bbox, page_size=None):
         x0, top, x1, bott = self._normalize_bbox(bbox)
-        if hasattr(self, "page_images") and self.page_images and len(self.page_images) > page_idx:
-            page_width, page_height = self.page_images[page_idx].size
+        target_page_size = self._get_page_size(page_idx)
+        if target_page_size is not None:
+            page_width, page_height = target_page_size
             if max(abs(x0), abs(x1), abs(top), abs(bott)) <= 1:
                 x0, x1 = x0 * page_width, x1 * page_width
                 top, bott = top * page_height, bott * page_height
@@ -411,7 +441,8 @@ class MinerUParser(RAGFlowPdfParser):
         if middle_positions:
             return "".join(self._format_line_tag(pos["page_idx"], pos["bbox"]) for pos in middle_positions)
 
-        return self._format_line_tag(bx["page_idx"], self._content_bbox_to_page_space(bx["page_idx"], bx.get("bbox", (0, 0, 0, 0))))
+        bbox = self._content_bbox_to_page_space(bx["page_idx"], bx.get("bbox", (0, 0, 0, 0)))
+        return self._format_line_tag(bx["page_idx"], bbox) if bbox is not None else ""
 
     def crop(self, text, ZM=1, need_position=False):
         imgs = []
@@ -421,13 +452,14 @@ class MinerUParser(RAGFlowPdfParser):
                 return None, None
             return
 
-        if not getattr(self, "page_images", None):
+        page_images = self.page_images
+        if not page_images:
             self.logger.warning("[MinerU] crop called without page images; skipping image generation.")
             if need_position:
                 return None, None
             return
 
-        page_count = len(self.page_images)
+        page_count = len(page_images)
 
         filtered_poss = []
         for pns, left, right, top, bottom in poss:
@@ -459,7 +491,7 @@ class MinerUParser(RAGFlowPdfParser):
             if need_position:
                 return None, None
             return
-        last_page_height = self.page_images[last_page_idx].size[1]
+        last_page_height = page_images[last_page_idx].size[1]
         poss.append(
             (
                 [last_page_idx],
@@ -479,7 +511,7 @@ class MinerUParser(RAGFlowPdfParser):
 
             for pn in pns[1:]:
                 if 0 <= pn - 1 < page_count:
-                    bottom += self.page_images[pn - 1].size[1]
+                    bottom += page_images[pn - 1].size[1]
                 else:
                     self.logger.warning(f"[MinerU] Page index {pn}-1 out of range for {page_count} pages during crop; skipping height accumulation.")
 
@@ -487,7 +519,7 @@ class MinerUParser(RAGFlowPdfParser):
                 self.logger.warning(f"[MinerU] Base page index {pns[0]} out of range for {page_count} pages during crop; skipping this segment.")
                 continue
 
-            img0 = self.page_images[pns[0]]
+            img0 = page_images[pns[0]]
             x0, y0, x1, y1 = int(left), int(top), int(right), int(min(bottom, img0.size[1]))
             if x0 > x1:
                 x0, x1 = x1, x0
@@ -505,7 +537,7 @@ class MinerUParser(RAGFlowPdfParser):
                 if not (0 <= pn < page_count):
                     self.logger.warning(f"[MinerU] Page index {pn} out of range for {page_count} pages during crop; skipping this page.")
                     continue
-                page = self.page_images[pn]
+                page = page_images[pn]
                 x0, y0, x1, y1 = int(left), 0, int(right), int(min(bottom, page.size[1]))
                 if x0 > x1:
                     x0, x1 = x1, x0
@@ -638,37 +670,42 @@ class MinerUParser(RAGFlowPdfParser):
         target_text = self._table_match_text(output)
         page_idx = int(output["page_idx"])
         anchor_bbox = self._content_bbox_to_page_space(page_idx, output["bbox"])
-        matches = []
-
-        for idx, block in enumerate(middle_blocks):
-            if block["type"] != "table":
-                continue
-
-            block_text = block.get("text", "")
-            is_anchor = block["page_idx"] == page_idx and self._overlap_ratio(anchor_bbox, block["bbox"]) >= 0.5
-            is_text_match = len(block_text) >= 4 and target_text and (block_text in target_text or target_text in block_text)
-            if is_anchor or is_text_match:
-                matches.append((idx, block, is_anchor, is_text_match))
-
-        anchor_indices = [idx for idx, _, is_anchor, _ in matches if is_anchor]
-        if not anchor_indices:
+        if anchor_bbox is None:
+            return []
+        anchor_candidates = [(self._overlap_ratio(anchor_bbox, block["bbox"]), idx, block) for idx, block in enumerate(middle_blocks) if block["type"] == "table" and block["page_idx"] == page_idx]
+        anchor_candidates = [candidate for candidate in anchor_candidates if candidate[0] >= 0.5]
+        if not anchor_candidates:
             return []
 
-        first_anchor_idx = min(anchor_indices)
-        positions = []
-        seen = set()
+        _overlap, anchor_idx, anchor = max(anchor_candidates, key=lambda candidate: (candidate[0], -candidate[1]))
+        positions = [{"page_idx": anchor["page_idx"], "bbox": anchor["bbox"]}]
+        anchor_text = anchor.get("text", "")
+        anchor_offset = target_text.find(anchor_text) if anchor_text else -1
+        if anchor_offset < 0:
+            return positions
+        search_from = anchor_offset + len(anchor_text)
 
-        for idx, block, is_anchor, is_text_match in matches:
-            if not (is_anchor or (idx >= first_anchor_idx and is_text_match)):
+        expected_page = page_idx + 1
+        for block in middle_blocks[anchor_idx + 1 :]:
+            if block["type"] != "table":
                 continue
-
-            key = (block["page_idx"], *[round(v, 3) for v in block["bbox"]])
-            if key in seen:
+            block_page = block["page_idx"]
+            if block_page < expected_page:
                 continue
-            seen.add(key)
-            positions.append({"page_idx": block["page_idx"], "bbox": block["bbox"]})
+            if block_page > expected_page:
+                break
 
-        positions.sort(key=lambda item: (item["page_idx"], item["bbox"][1], item["bbox"][0]))
+            block_text = block.get("text", "")
+            if len(block_text) < 4 or not target_text:
+                break
+            match_offset = target_text.find(block_text, search_from)
+            if match_offset < 0:
+                break
+
+            positions.append({"page_idx": block_page, "bbox": block["bbox"]})
+            search_from = match_offset + len(block_text)
+            expected_page += 1
+
         return positions
 
     def _enrich_outputs_with_middle_positions(self, outputs: list[dict[str, Any]], middle_json: Path):
@@ -826,97 +863,184 @@ class MinerUParser(RAGFlowPdfParser):
         for item in data:
             for key in ("img_path", "table_img_path", "equation_img_path"):
                 if key in item and item[key]:
-                    item[key] = str((subdir / item[key]).resolve())
+                    item[key] = str(self._resolve_result_media_path(subdir, str(item[key])))
         return data
+
+    @staticmethod
+    def _resolve_result_media_path(result_dir: Path, media_path: str) -> Path:
+        """Resolve a relative MinerU media path without leaving its result directory."""
+        normalized_path = media_path.replace("\\", "/")
+        if normalized_path.startswith("/") or re.match(r"^[A-Za-z]:/", normalized_path):
+            raise RuntimeError(f"[MinerU] Unsafe media path (absolute): {media_path}")
+        if ".." in Path(normalized_path).parts:
+            raise RuntimeError(f"[MinerU] Unsafe media path (traversal): {media_path}")
+
+        base_dir = result_dir.resolve()
+        resolved_path = (base_dir / normalized_path).resolve(strict=False)
+        if resolved_path != base_dir and base_dir not in resolved_path.parents:
+            raise RuntimeError(f"[MinerU] Unsafe media path (escape): {media_path}")
+        return resolved_path
+
+    def _normalize_output_type(self, output: dict[str, object]) -> MinerUContentType | None:
+        raw_type = str(output.get("type", "") or "").strip().lower()
+        try:
+            return MinerUContentType(raw_type)
+        except ValueError:
+            self.logger.debug("[MinerU] Skip unsupported section type=%s", output.get("type"))
+            return None
+
+    @staticmethod
+    def _normalize_text_lines(values: Sequence[object] | None) -> list[str]:
+        """Normalize MinerU caption/footnote arrays into non-empty strings."""
+        lines = []
+        for value in values or []:
+            text = str(value or "").strip()
+            if text:
+                lines.append(text)
+        return lines
+
+    def _build_image_texts(self, output: dict[str, object]) -> list[str]:
+        """Build raw caption and footnote text lines for a MinerU image block."""
+        image_caption = output.get("image_caption")
+        image_footnote = output.get("image_footnote")
+        texts = self._normalize_text_lines(image_caption if isinstance(image_caption, list) else None)
+        texts.extend(self._normalize_text_lines(image_footnote if isinstance(image_footnote, list) else None))
+        return texts
+
+    def _build_table_text(self, output: dict[str, object]) -> str:
+        """Build searchable HTML/text payload for a MinerU table block."""
+        table_caption = output.get("table_caption")
+        table_footnote = output.get("table_footnote")
+        parts = [str(output.get("table_body") or "").strip()]
+        parts.extend(self._normalize_text_lines(table_caption if isinstance(table_caption, list) else None))
+        parts.extend(self._normalize_text_lines(table_footnote if isinstance(table_footnote, list) else None))
+        return "\n".join(part for part in parts if part)
+
+    def _load_image_from_path(self, image_path: str | None) -> Optional[Image.Image]:
+        if not image_path:
+            return None
+        try:
+            with Image.open(image_path) as image:
+                image.load()
+                return image.copy()
+        except Exception as exc:
+            self.logger.warning(f"[MinerU] Failed to load image '{image_path}': {exc}")
+            return None
+
+    def _resolve_output_image(self, output: dict[str, object], position_tag: str, path_keys: tuple[str, ...]) -> Optional[Image.Image]:
+        for key in path_keys:
+            image = self._load_image_from_path(str(output.get(key) or ""))
+            if image is not None:
+                return image
+
+        if not position_tag:
+            return None
+        try:
+            return self.crop(position_tag, 1)
+        except Exception as exc:
+            self.logger.warning(f"[MinerU] Failed to crop media fallback image: {exc}")
+            return None
+
+    def _has_renderable_position(self, position_tag: str) -> bool:
+        """Return whether a local position tag references at least one rendered page."""
+        if not position_tag or not self.page_images:
+            return False
+        page_count = len(self.page_images)
+        return any(pages and any(0 <= page < page_count for page in pages) for pages, *_bounds in self.extract_positions(position_tag))
 
     def _transfer_to_sections(self, outputs: list[dict[str, Any]], parse_method: str = None, table_enable: bool = False):
         sections = []
+        parse_method = (parse_method or "raw").lower()
         for output in outputs:
-            match output.get("type"):
+            output_type = self._normalize_output_type(output)
+            if output_type is None:
+                continue
+            if output_type in {MinerUContentType.DISCARDED, MinerUContentType.HEADER, MinerUContentType.FOOTER, MinerUContentType.PAGE_NUMBER}:
+                continue
+            # The DSL pipeline consumes sections in source order. RAG app chunkers
+            # consume media blocks separately and must not receive duplicate media.
+            if parse_method != "pipeline" and (output_type == MinerUContentType.IMAGE or (output_type == MinerUContentType.TABLE and table_enable)):
+                continue
+
+            match output_type:
                 case MinerUContentType.TEXT:
                     section = output.get("text", "")
                 case MinerUContentType.TABLE:
-                    section = output.get("table_body", "") + "\n".join(output.get("table_caption", [])) + "\n".join(output.get("table_footnote", []))
-                    if not section.strip():
-                        section = "FAILED TO PARSE TABLE"
+                    section = self._build_table_text(output)
+                    if not table_enable:
+                        section = self._sanitize_section_text(section)
                 case MinerUContentType.IMAGE:
-                    section = "".join(output.get("image_caption", [])) + "\n" + "".join(output.get("image_footnote", []))
-                    # If a vision model enriched this image with a semantic
-                    # description (see _enhance_images_with_vlm), embed it in
-                    # the chunk so it becomes searchable / retrievable.
-                    vlm_description = (output.get("vlm_description") or "").strip()
-                    if vlm_description:
-                        section = (section.strip("\n") + "\n" + vlm_description).strip("\n") if section.strip() else vlm_description
+                    section = "\n".join(self._build_image_texts(output))
                 case MinerUContentType.EQUATION:
                     section = output.get("text", "")
                 case MinerUContentType.CODE:
-                    section = output.get("code_body", "") + "\n".join(output.get("code_caption", []))
+                    code_caption = output.get("code_caption")
+                    section = str(output.get("code_body") or "") + "\n".join(self._normalize_text_lines(code_caption if isinstance(code_caption, list) else None))
                 case MinerUContentType.LIST:
-                    section = "\n".join(output.get("list_items", []))
-                case MinerUContentType.HEADER | MinerUContentType.FOOTER | MinerUContentType.PAGE_NUMBER | MinerUContentType.DISCARDED:
-                    continue
-                case _:
-                    self.logger.debug("[MinerU] Skip unsupported section type=%s", output.get("type"))
-                    continue
+                    list_items = output.get("list_items")
+                    section = "\n".join(self._normalize_text_lines(list_items if isinstance(list_items, list) else None))
 
-            if not table_enable:
-                section = self._sanitize_section_text(section)
-            if not section:
-                self.logger.debug("[MinerU] Skip section after sanitization: type=%s", output.get("type"))
+            section = str(section or "")
+            position_tag = self._line_tag(output) if "page_idx" in output and "bbox" in output else ""
+            keep_empty_media = (
+                parse_method == "pipeline" and self._has_renderable_position(position_tag) and (output_type == MinerUContentType.IMAGE or (output_type == MinerUContentType.TABLE and table_enable))
+            )
+            if not section and not keep_empty_media:
+                if output_type == MinerUContentType.TABLE:
+                    self.logger.warning("[MinerU] Skip empty table without text or renderable image")
+                self.logger.debug("[MinerU] Skip empty section after normalization: type=%s", output.get("type"))
                 continue
 
-            if section and parse_method in {"manual", "pipeline"}:
-                sections.append((section, output["type"], self._line_tag(output)))
-            elif section and parse_method == "paper":
-                sections.append((section + self._line_tag(output), output["type"]))
+            if parse_method in {"manual", "pipeline"}:
+                sections.append((section, output_type.value, position_tag))
+            elif parse_method == "paper":
+                sections.append((section + position_tag, output_type.value))
             else:
-                sections.append((section, self._line_tag(output)))
+                sections.append((section, position_tag))
         return sections
 
-    def _transfer_to_tables(self, outputs: list[dict[str, Any]]):
-        return []
+    def _transfer_to_media_blocks(self, outputs: list[dict[str, Any]], table_enable: bool = True):
+        tables = []
+        table_count = 0
+        image_count = 0
+        for output in outputs:
+            output_type = self._normalize_output_type(output)
+            if output_type not in {MinerUContentType.TABLE, MinerUContentType.IMAGE}:
+                self.logger.debug("[MinerU] Skip non-media type=%s", output.get("type"))
+                continue
 
-    def _enhance_images_with_vlm(self, outputs: list[dict[str, Any]], vision_model, callback: Optional[Callable] = None, language: str = "English"):
-        """Generate semantic descriptions for image blocks via the tenant's
-        VISION model, mirroring deepdoc's VisionFigureParser. Each
-        IMAGE block with a readable img_path gets a ``vlm_description``
-        field that ``_transfer_to_sections`` then folds into the chunk
-        text — closing issue #14869.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from rag.app.picture import vision_llm_chunk
-        from rag.prompts.generator import vision_llm_figure_describe_prompt
+            position_tag = self._line_tag(output) if "page_idx" in output and "bbox" in output else ""
+            positions = [(pages[-1] + self.page_from, left, right, top, bottom) for pages, left, right, top, bottom in self.extract_positions(position_tag) if pages]
 
-        image_jobs = [(idx, item) for idx, item in enumerate(outputs) if item.get("type") == MinerUContentType.IMAGE and item.get("img_path") and os.path.exists(item["img_path"])]
-        if not image_jobs:
-            return
+            if output_type == MinerUContentType.TABLE:
+                if not table_enable:
+                    self.logger.debug("[MinerU] Skip table (table_enable=False)")
+                    continue
+                table_text = self._build_table_text(output)
+                table_image = self._resolve_output_image(output, position_tag, ("table_img_path", "img_path"))
+                if not table_text and table_image is None:
+                    self.logger.warning("[MinerU] Skip empty table without text or renderable image")
+                    continue
+                tables.append(((table_image, table_text if table_text else [""]), positions))
+                table_count += 1
+                continue
 
-        if callback:
-            callback(0.78, f"[MinerU] Generating VLM descriptions for {len(image_jobs)} images...")
+            if output_type == MinerUContentType.IMAGE:
+                image = self._resolve_output_image(output, position_tag, ("img_path", "table_img_path"))
+                image_texts = self._build_image_texts(output)
+                if image is None and not image_texts:
+                    self.logger.debug("[MinerU] Skip empty image without resource, caption, or crop position")
+                    continue
+                tables.append(((image, image_texts or [""]), positions))
+                image_count += 1
 
-        prompt = vision_llm_figure_describe_prompt(language=language or "English")
-
-        def worker(idx, item):
-            try:
-                with Image.open(item["img_path"]) as img:
-                    img.load()
-                    desc = vision_llm_chunk(binary=img, vision_model=vision_model, prompt=prompt)
-                return idx, (desc or "").strip()
-            except Exception as e:
-                logging.warning(f"[MinerU] VLM description failed for image #{idx}: {e}")
-                return idx, ""
-
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(worker, idx, item) for idx, item in image_jobs]
-            for fut in as_completed(futures):
-                idx, desc = fut.result()
-                if desc:
-                    outputs[idx]["vlm_description"] = desc
+        self.logger.info("[MinerU] Media blocks produced: %d table(s), %d image(s)", table_count, image_count)
+        return tables
 
     def parse_pdf(
         self,
         filepath: str | PathLike[str],
-        binary: BytesIO | bytes,
+        binary: BytesIO | bytes | None = None,
         callback: Optional[Callable] = None,
         *,
         output_dir: Optional[str] = None,
@@ -928,11 +1052,12 @@ class MinerUParser(RAGFlowPdfParser):
         page_to: int = MAXIMUM_PAGE_NUMBER,
         **kwargs,
     ) -> tuple:
-        import shutil
-
-        self.outlines = extract_pdf_outlines(binary if binary is not None else filepath)
-        temp_pdf = None
-        created_tmp_dir = False
+        file_path = Path(filepath)
+        binary_bytes = binary.getvalue() if isinstance(binary, BytesIO) else binary
+        self.outlines = extract_pdf_outlines(binary_bytes if binary_bytes is not None else str(file_path))
+        temp_input_dir: Path | None = None
+        out_dir: Path | None = None
+        created_output_dir = False
 
         parser_cfg = kwargs.get("parser_config", {})
         lang = parser_cfg.get("mineru_lang") or kwargs.get("lang") or "English"
@@ -941,44 +1066,42 @@ class MinerUParser(RAGFlowPdfParser):
         enable_formula = parser_cfg.get("mineru_formula_enable", True)
         enable_table = parser_cfg.get("mineru_table_enable", True)
 
-        # remove spaces, or mineru crash, and _read_output fail too
-        file_path = Path(filepath)
-        pdf_file_name = file_path.stem.replace(" ", "") + ".pdf"
-        pdf_file_path_valid = os.path.join(file_path.parent, pdf_file_name)
-
-        if binary:
-            temp_dir = Path(tempfile.mkdtemp(prefix="mineru_bin_pdf_"))
-            temp_pdf = temp_dir / pdf_file_name
-            with open(temp_pdf, "wb") as f:
-                f.write(binary)
-            pdf = temp_pdf
-            self.logger.info(f"[MinerU] Received binary PDF -> {temp_pdf}")
-            if callback:
-                callback(0.15, f"[MinerU] Received binary PDF -> {temp_pdf}")
-        else:
-            if pdf_file_path_valid != filepath:
-                self.logger.info(f"[MinerU] Remove all space in file name: {pdf_file_path_valid}")
-                shutil.move(filepath, pdf_file_path_valid)
-            pdf = Path(pdf_file_path_valid)
-            if not pdf.exists():
-                if callback:
-                    callback(-1, f"[MinerU] PDF not found: {pdf}")
-                raise FileNotFoundError(f"[MinerU] PDF not found: {pdf}")
-
-        if output_dir:
-            out_dir = Path(output_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            out_dir = Path(tempfile.mkdtemp(prefix="mineru_pdf_"))
-            created_tmp_dir = True
-
-        self.logger.info(f"[MinerU] Output directory: {out_dir} backend={backend} api={self.mineru_api} server_url={server_url or self.mineru_server_url}")
-        if callback:
-            callback(0.15, f"[MinerU] Output directory: {out_dir}")
-
-        self.__images__(pdf, zoomin=1)
+        pdf_file_name = (file_path.stem.replace(" ", "") or "document") + ".pdf"
 
         try:
+            if binary_bytes is not None:
+                temp_input_dir = Path(tempfile.mkdtemp(prefix="mineru_input_pdf_"))
+                pdf = temp_input_dir / pdf_file_name
+                pdf.write_bytes(binary_bytes)
+                self.logger.info(f"[MinerU] Received binary PDF -> {pdf}")
+                if callback:
+                    callback(0.15, f"[MinerU] Received binary PDF -> {pdf}")
+            else:
+                if not file_path.exists():
+                    if callback:
+                        callback(-1, f"[MinerU] PDF not found: {file_path}")
+                    raise FileNotFoundError(f"[MinerU] PDF not found: {file_path}")
+                if " " in file_path.name:
+                    temp_input_dir = Path(tempfile.mkdtemp(prefix="mineru_input_pdf_"))
+                    pdf = temp_input_dir / pdf_file_name
+                    shutil.copy2(file_path, pdf)
+                    self.logger.info(f"[MinerU] Copied PDF to space-free temporary path: {pdf}")
+                else:
+                    pdf = file_path
+
+            if output_dir:
+                out_dir = Path(output_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                out_dir = Path(tempfile.mkdtemp(prefix="mineru_pdf_"))
+                created_output_dir = True
+
+            self.logger.info(f"[MinerU] Output directory: {out_dir} backend={backend} api={self.mineru_api} server_url={server_url or self.mineru_server_url}")
+            if callback:
+                callback(0.15, f"[MinerU] Output directory: {out_dir}")
+
+            self.__images__(pdf, zoomin=1, page_from=page_from, page_to=page_to)
+
             options = MinerUParseOptions(
                 backend=MinerUBackend(backend),
                 lang=MinerULanguage(mineru_lang_code),
@@ -995,26 +1118,24 @@ class MinerUParser(RAGFlowPdfParser):
             if callback:
                 callback(0.75, f"[MinerU] Parsed {len(outputs)} blocks from PDF.")
 
-            vision_model = kwargs.get("vision_model")
-            if vision_model is not None:
-                try:
-                    self._enhance_images_with_vlm(outputs, vision_model, callback=callback, language=lang)
-                except Exception as e:
-                    self.logger.warning(f"[MinerU] VLM image enhancement failed: {e}. Continuing without descriptions.")
+            sections = self._transfer_to_sections(outputs, parse_method, enable_table)
+            if (parse_method or "raw").lower() == "pipeline":
+                return sections, []
 
-            return self._transfer_to_sections(outputs, parse_method, enable_table), self._transfer_to_tables(outputs)
+            # VISION enrichment belongs to the caller after media ownership is
+            # resolved, preventing Manual and Paper from processing an image twice.
+            return sections, self._transfer_to_media_blocks(outputs, enable_table)
         finally:
-            if temp_pdf and temp_pdf.exists():
+            if temp_input_dir is not None:
                 try:
-                    temp_pdf.unlink()
-                    temp_pdf.parent.rmdir()
-                except Exception:
-                    pass
-            if delete_output and created_tmp_dir and out_dir.exists():
+                    shutil.rmtree(temp_input_dir)
+                except Exception as exc:
+                    self.logger.warning(f"[MinerU] Failed to remove temporary input directory {temp_input_dir}: {exc}")
+            if delete_output and created_output_dir and out_dir is not None and out_dir.exists():
                 try:
                     shutil.rmtree(out_dir)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.logger.warning(f"[MinerU] Failed to remove temporary output directory {out_dir}: {exc}")
 
 
 if __name__ == "__main__":
