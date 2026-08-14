@@ -50,6 +50,7 @@ Return JSON:
   "confidence": 0.0,
   "report": "Short evidence-backed finding, or what was learned so far.",
   "gaps": ["specific missing fact or relationship"],
+  "intermediate": "ONE bridge entity or relationship that must be retrieved BEFORE the claim can be answered, e.g. for 'company that Brian Bergstein is employed by violates which law' the intermediate is 'Who is Brian Bergstein's employer?'. Empty string if none / not a multi-hop bridge.",
   "next_queries": ["standalone follow-up search query"],
   "grounded": ["key asserted facts that ARE directly supported by the cited evidence, atomically and verbatim enough to match"],
   "numbers": ["for numerical/multi-hop answers: each figure used + its source, e.g. '2,161,000 from Wikipedia Demographics of Paris'; list ALL conflicting figures if several sources disagree"]
@@ -81,7 +82,29 @@ async def decompose_and_search(state: dict, tools) -> dict:
     _STAGNATION_CYCLES = 2
     _STAGNATION_GAIN = 0.05
 
-    for cycle in range(max_cycles):
+    # ---- Level-2 replan (planner feedback) budget ----
+    # After the inner loop exhausts its cycles without a sufficient verdict, if the
+    # AutoRater feedback points at NEW sub-questions (claims decomposition missed a
+    # sub-problem), re-plan with the feedback and re-run the inner loop. Cap the
+    # number of replans to avoid unbounded cost. This is the "new sub-question"
+    # tier between inner re-search (Level 1) and outer question-rewrite (Level 3).
+    replan_budget = 2 if getattr(mode, "allows_replan", False) else 0
+    replan_count = 0
+    # Tracks whether the last pass ended insufficient (partial) so the loop below
+    # can decide to replan instead of finalizing.
+    last_partial = False
+    last_feedback = ""
+    # AutoRater boost + fusion verdict are defined inside the loop; default them here
+    # so the while-else / replan blocks never reference an unbound name.
+    boost: dict = {}
+    verdict = None
+
+    # Level-2 replan may re-enter the inner research loop with expanded claims by
+    # resetting ``cycle = 0`` and ``continue`` (the continue below is inside the
+    # ``while cycle < max_cycles`` loop, so it is valid). ``cycle`` is reset on
+    # replan so the new claims get the full budget.
+    cycle = 0
+    while cycle < max_cycles:
         ctx.iteration = cycle
         unverified = [c for c in ctx.claims if not c.is_verified]
         if not unverified:
@@ -96,12 +119,27 @@ async def decompose_and_search(state: dict, tools) -> dict:
 
         tasks = []
         searched_claims = []
+        # AutoRater follow-ups (missing-information queries) are a global pool that
+        # targets the next round at the reported gaps. ``gen_followups`` returns
+        # ``[{question, query}]``; we use each follow-up's search query (falling back
+        # to its question). A working copy is passed so each claim can consume one;
+        # dedup via `attempted_queries` prevents re-search.
+        raw_pool = getattr(ctx, "pending_followups", None) or []
+        global_pool = []
+        for fu in raw_pool:
+            if isinstance(fu, dict):
+                q = (fu.get("query") or fu.get("question") or "").strip()
+            else:
+                q = str(fu).strip()
+            if q:
+                global_pool.append(q)
         for c in unverified:
             query = _pick_next_query(
                 question,
                 c,
                 attempted_queries.setdefault(c.claim_id, set()),
                 pending_queries.setdefault(c.claim_id, []),
+                global_pool=global_pool,
             )
             if not query:
                 _LOG.info("[Decompose search] No unused follow-up query remains for claim %s.", c.claim_id)
@@ -216,25 +254,32 @@ async def decompose_and_search(state: dict, tools) -> dict:
             if boost:
                 _LOG.info("[Decompose] AutoRater is_sufficient=%s confidence=%.2f", boost.get("is_sufficient"), boost.get("confidence", 1.0))
 
-        # LLM groundedness review (Google "draft review"): runs unconditionally so every
-        # decomposed result — including a non-critical-band SUFFICIENT — is groundedness-
-        # validated before the status gate. (The lexical NER grounded check is disabled
-        # in favour of this LLM review, so it must not be skipped on any path.) Ungrounded
+        # LLM groundedness review (Google "draft review"): validates the claim drafts
+        # against the cited evidence. It runs whenever this round could produce an
+        # answer (code verdict SUFFICIENT / borderline), but is skipped for a verdict
+        # that clearly won't (INSUFFICIENT / UNANSWERABLE → loop continues or abstains),
+        # so the token cost of the unconditional draft review is bounded. Ungrounded
         # claim drafts are merged into hard_violations → decision ladder caveat.
         from rag.advanced_rag.harness.orchestrator.grounded_llm import llm_grounded_verify
 
-        # Union of cited evidence IDs across all claim results (matches the
-        # agentic orchestrator's cited-evidence behavior) so the reviewer sees
-        # the exact evidence each claim referenced, not a global prefix.
-        cited_evidence_ids: list[str] = []
-        for r in agent_results:
-            cited_evidence_ids.extend(r.evidence_ids or [])
-        grounded = await llm_grounded_verify(
-            tools,
-            ctx.question,
-            [(r.claim_id, r.report or "") for r in agent_results if r.report],
-            cited_evidence_ids or None,
-        )
+        grounded: dict = {}
+        if verdict.status not in ("INSUFFICIENT", "UNANSWERABLE"):
+            # Union of cited evidence IDs across all claim results (matches the
+            # agentic orchestrator's cited-evidence behavior) so the reviewer sees
+            # the exact evidence each claim referenced, not a global prefix.
+            cited_evidence_ids: list[str] = []
+            for r in agent_results:
+                cited_evidence_ids.extend(r.evidence_ids or [])
+            try:
+                grounded = await llm_grounded_verify(
+                    tools,
+                    ctx.question,
+                    [(r.claim_id, r.report or "") for r in agent_results if r.report],
+                    cited_evidence_ids or None,
+                )
+            except Exception:
+                _LOG.exception("[Decompose] grounded review failed; proceeding without grounded veto")
+                grounded = {}
         # Treat a claim as violating when it is explicitly grounded=False OR has
         # non-empty ungrounded assertions (covers the degenerate grounded=False /
         # empty-ungrounded case too). Only accept IDs that exist in the original
@@ -257,22 +302,62 @@ async def decompose_and_search(state: dict, tools) -> dict:
         if caveat:
             _LOG.info("[Decompose] caveat=%s", caveat)
 
+        # ---- Selective generation (paper §3/§5.1) ----
+        # The paper shows models often still answer correctly (35-62%) even when the
+        # sufficiency verdict says "not enough context". So on UNANSWERABLE with any
+        # retrieved evidence, do not hard-abstain (which guarantees 0) — downgrade to
+        # a caveated/partial answer and let the answer stage try. Only a true empty
+        # evidence pool abstains.
+        if action == "UNANSWERABLE" and (tools.kbinfos.get("chunks") or []):
+            _LOG.info("[Decompose] Selective: UNANSWERABLE but %d chunk(s) retrieved — downgrading to partial answer.", len(tools.kbinfos.get("chunks") or []))
+            action = "ANSWER_PARTIAL"
+            should_continue = False
+
         # Stagnation guard: if the verdict is not (yet) sufficient and the score
         # has not meaningfully improved across consecutive rounds, stop instead
         # of burning the remaining cycle budget on unproductive re-searches.
         if should_continue and verdict.status in ("INSUFFICIENT", "USEFUL_BUT_INCOMPLETE"):
             if prev_score is not None and cycle >= _STAGNATION_CYCLES and verdict.score - prev_score < _STAGNATION_GAIN:
                 _LOG.info(
-                    "[Decompose] Round %d: score stagnant (%.3f → %.3f) — early-stopping to partial answer",
+                    "[Decompose] Round %d: score stagnant (%.3f → %.3f) — trying Level-2 replan before settling for partial",
                     cycle + 1,
                     prev_score,
                     verdict.score,
                 )
+                # Stagnation usually means the current claims cannot be resolved with
+                # the corpus — but the AutoRater feedback may still point at NEW
+                # sub-questions. Try Level-2 replan before settling for partial.
+                last_partial = any(not c.is_verified for c in ctx.claims)
+                fb = boost.get("feedback") or verdict.feedback or ""
+                last_feedback = str(fb) if fb else ""
+                replanned = False
+                if last_partial and replan_count < replan_budget and last_feedback:
+                    replanned = await _try_replan(ctx, tools, question, keywords, route, last_feedback, replan_count)
+                if replanned:
+                    replan_count += 1
+                    attempted_queries.update({c.claim_id: set() for c in ctx.claims if c.claim_id not in attempted_queries})
+                    pending_queries.update({c.claim_id: [] for c in ctx.claims if c.claim_id not in pending_queries})
+                    last_partial = False
+                    last_feedback = ""
+                    prev_score = None
+                    cycle = 0
+                    continue  # re-enter the inner loop with the expanded claims
                 action = "ANSWER_PARTIAL"
                 should_continue = False
             else:
                 prev_score = verdict.score
 
+        # ---- SCA review (Google Phase 5) ----
+        # Before accepting a full ANSWER, the SCA double-checks for missing pieces.
+        # If the AutoRater explicitly reported missing information but the decision
+        # ladder still produced a full ANSWER (a contradiction), downgrade to
+        # ANSWER_PARTIAL so the final answer does not overclaim. This is a cheap
+        # last-quality-gate and only fires on an explicit missing signal.
+        if action == "ANSWER":
+            _sca_missing = boost.get("missing") or []
+            if _sca_missing:
+                _LOG.info("[Decompose] SCA review: AutoRater reported %d missing piece(s) despite full-ANSWER verdict — downgrading to partial.", len(_sca_missing))
+                action = "ANSWER_PARTIAL"
         if action in ("ANSWER", "ANSWER_PARTIAL"):
             return _finalize(ctx, tools, partial=action == "ANSWER_PARTIAL", loop=completed_cycles)
         if action == "ABSTAIN":
@@ -281,7 +366,33 @@ async def decompose_and_search(state: dict, tools) -> dict:
         if action == "FALLBACK_LLM":
             return _finalize(ctx, tools, partial=True, loop=completed_cycles)
         if not should_continue:
+            # Verdict says stop (e.g. GAP budget exhausted or ladder decided stop).
+            # If the verdict is still partial and the feedback points at NEW
+            # sub-questions (Level 2), re-plan the claims with the feedback and
+            # re-enter the inner loop (same question/keywords → same search
+            # direction) instead of finalizing a partial answer.
+            last_partial = any(not c.is_verified for c in ctx.claims)
+            fb = boost.get("feedback") or verdict.feedback or ""
+            last_feedback = str(fb) if fb else ""
+            replanned = False
+            if last_partial and replan_count < replan_budget and last_feedback:
+                replanned = await _try_replan(ctx, tools, question, keywords, route, last_feedback, replan_count)
+            if replanned:
+                replan_count += 1
+                attempted_queries.update({c.claim_id: set() for c in ctx.claims if c.claim_id not in attempted_queries})
+                pending_queries.update({c.claim_id: [] for c in ctx.claims if c.claim_id not in pending_queries})
+                last_partial = False
+                last_feedback = ""
+                prev_score = None
+                cycle = 0
+                continue  # re-enter the inner loop with the expanded claims
             break
+        cycle += 1
+    else:
+        # while-else: loop exhausted max_cycles without a sufficient verdict.
+        # (No replan here — running out of cycles usually means the corpus lacks
+        # the data; replan would not help. Finalize as partial.)
+        pass
 
     if not tools.kbinfos.get("chunks"):
         return {"empty_result": True, "kbinfos": tools.kbinfos, "loop": completed_cycles}
@@ -375,7 +486,16 @@ def _normalize_analysis(
     is_verified = bool(parsed.get("is_verified")) and bool(evidence_ids) and confidence >= 0.55
     report = str(parsed.get("report") or "").strip() or _summarize(result)
     gaps = _string_list(parsed.get("gaps"))
+    # Multi-hop step-wise retrieval: if the claim needs a bridge entity/relationship
+    # (e.g. "employer of X" before "which law X's employer violated"), the analysis
+    # emits an ``intermediate`` query. Search it FIRST next round so we resolve the
+    # intermediate node (e.g. Uber) before re-targeting the final answer. This is what
+    # makes multi-hop questions retrieve correctly instead of one-shot keyword hit.
+    intermediate = str(parsed.get("intermediate") or "").strip()
     next_queries = _string_list(parsed.get("next_queries"))[:_MAX_NEXT_QUERIES]
+    if intermediate and not is_verified:
+        next_queries = [intermediate] + [q for q in next_queries if q != intermediate]
+        next_queries = next_queries[:_MAX_NEXT_QUERIES]
     grounded = _string_list(parsed.get("grounded"))
     numbers = _string_list(parsed.get("numbers"))
 
@@ -422,17 +542,87 @@ def _fallback_analysis(
     }
 
 
+async def _try_replan(
+    ctx: OrchestratorContext,
+    tools,
+    question: str,
+    keywords: str,
+    route,
+    feedback: str,
+    replan_count: int,
+) -> bool:
+    """Level-2: re-plan the claims with the sufficient feedback.
+
+    Calls the planner with ``feedback`` so it can decompose the question into NEW
+    sub-questions that the original plan missed. New claims (not already in
+    ``ctx.claims``) are appended and later researched by the re-entered inner loop.
+    Returns True if at least one new claim was added.
+    """
+    from rag.advanced_rag.harness.planner import planner_node
+
+    existing_desc = {c.description.strip().lower() for c in ctx.claims}
+    pstate = {
+        "question": question,
+        "keywords": keywords,
+        "route": route,
+        "seed_chunks": tools.kbinfos.get("chunks", []),
+        "feedback": feedback,
+    }
+    _LOG.info("[Decompose] Level-2 replan (attempt %d) with feedback: %s", replan_count + 1, _snip(feedback))
+    try:
+        plan = await planner_node(pstate, tools)
+    except Exception:
+        _LOG.exception("[Decompose] Level-2 replan failed")
+        return False
+    new_claims_raw = plan.get("claims", []) or []
+    added = 0
+    for nc in new_claims_raw:
+        obj = ClaimTarget(**nc) if isinstance(nc, dict) else nc
+        key = obj.description.strip().lower()
+        if key and key not in existing_desc:
+            obj.claim_id = f"r{replan_count}_{obj.claim_id}"
+            ctx.claims.append(obj)
+            existing_desc.add(key)
+            added += 1
+    if added:
+        _LOG.info("[Decompose] Replan added %d new claim(s); total %d.", added, len(ctx.claims))
+    return added > 0
+
+
 def _pick_next_query(
     question: str,
     claim: ClaimTarget,
     attempted: set[str],
     pending: list[str],
+    global_pool: list[str] | None = None,
 ) -> str:
+    # 0. Multi-hop: resolve the claim's prerequisite (bridge entity/relationship)
+    # before targeting the claim itself. The first time the claim is researched, the
+    # prerequisite OPEN query is searched; the found entity feeds back through the
+    # evidence the next round (the analyzer then re-targets the claim).
+    prereq = (claim.prerequisite or "").strip()
+    if prereq and not attempted:
+        normalized = _normalize_query(prereq)
+        if normalized and normalized not in attempted:
+            return prereq
+
+    # 1. claim-specific pending follow-ups (from _analyze_claim_evidence).
     while pending:
         query = (pending.pop(0) or "").strip()
         normalized = _normalize_query(query)
         if normalized and normalized not in attempted:
             return query
+
+    # 2. AutoRater follow-ups (missing-information queries) — a global pool for the
+    #    whole question. Consume them before falling back to claim-description
+    #    paraphrases, so the next round is *targeted* at the reported gaps rather
+    #    than re-searching the same angles.
+    if global_pool:
+        while global_pool:
+            query = (global_pool.pop(0) or "").strip()
+            normalized = _normalize_query(query)
+            if normalized and normalized not in attempted:
+                return query
 
     candidates = []
     if not attempted:

@@ -393,6 +393,58 @@ class Base(ABC):
     def _verbose_tool_use(self, name, args, res):
         return "<tool_call>" + json.dumps({"name": name, "args": args, "result": res}, ensure_ascii=False, indent=2) + "</tool_call>"
 
+    @staticmethod
+    def _strip_tool_calls(text):
+        """Remove <tool_call>...</tool_call> traces that _verbose_tool_use
+        accumulates, so the returned answer text never contains the raw tool
+        invocation JSON (which small models otherwise leak when they keep calling
+        a terminal tool until max_rounds). The traces are informational only; the
+        answer text is the model's final relay.
+
+        Robust against malformed output: small models frequently emit partially
+        mangled tool-call markup (nested blocks, a closing tag missing its `<`,
+        or a truncated tail). We therefore loop until nothing changes, match both
+        well-formed and degraded open/close delimiters, and drop any dangling
+        tool-call tail left at the end of the string.
+        """
+        import re as _re
+
+        if not text:
+            return text
+
+        # Well-formed block: <tool_call> ... </tool_call>  (non-greedy).
+        _block = _re.compile(r"<tool_call>.*?</tool_call>", _re.DOTALL)
+        # Degraded variants small models produce:
+        #   - opening tag missing its '<'   -> "tool_call>.../tool_call>"
+        #   - closing tag missing its '<'   -> "<tool_call>...\n/tool_call>"
+        #   - generic markup pairs like "invoke name=\"...\" .../invoke>"
+        #   - both open and close missing their '<' (very mangled output)
+        # Closing delimiters are matched leniently: allow a missing leading '<'
+        # so "<tool_call>.../tool_call>" and "<tool_call>...\n/tool_call>" and
+        # "<tool_call>.../invoke>" all get dropped.
+        _degraded = _re.compile(
+            r"<?tool_call>.*?(?:</?tool_call>|/?tool_call>|/?invoke>)"
+            r"|invoke name=[\"'][^\"']*[\"'][^>]*>.*?(?:</invoke>|/?invoke>)",
+            _re.DOTALL,
+        )
+
+        prev = None
+        cur = text
+        # Loop: a single pass can leave a nested/second block behind, and the
+        # malformed closing tag only becomes matchable after the enclosing block
+        # is removed. Iterate to fixpoint.
+        while prev != cur:
+            prev = cur
+            cur = _block.sub("", cur)
+            cur = _degraded.sub("", cur)
+
+        # Drop a dangling tool-call tail: a truncated "<tool_call>..." with no
+        # close, or a leftover "/tool_call>" / "tool_call>" that the block pass
+        # left at the very end of the string.
+        cur = _re.sub(r"(?:<?tool_call>|/?tool_call>)\s*$", "", cur)
+        # Trim stray leading/trailing blank lines the removals can leave behind.
+        return cur.strip()
+
     def _append_history(self, hist, tool_call, tool_res):
         hist.append(
             {
@@ -524,7 +576,7 @@ class Base(ABC):
                         if response.choices[0].finish_reason == "length":
                             ans = self._length_stop(ans)
 
-                        return ans, tk_count
+                        return self._strip_tool_calls(ans), tk_count
 
                     async def _exec_tool(tc):
                         name = tc.function.name
@@ -558,7 +610,7 @@ class Base(ABC):
                 agg_usage["total_tokens"] += int(_fb.get("total_tokens", 0) or token_count)
                 tk_count = agg_usage["total_tokens"]
                 self.last_usage = dict(agg_usage)
-                return ans, tk_count
+                return self._strip_tool_calls(ans), tk_count
             except Exception as e:
                 e = await self._exceptions_async(e, attempt)
                 if e:
@@ -2170,6 +2222,10 @@ class LiteLLMBase(ABC):
         if system and history and history[0].get("role") != "system":
             history.insert(0, {"role": "system", "content": system})
 
+        # Per-call reset of the repeated-rag guard so it does not carry over
+        # between different user questions on a reused model instance.
+        self._ctx_rag_calls = 0
+
         ans = ""
         tk_count = 0
         # Aggregate prompt/completion/total across every tool-calling round so the
@@ -2350,13 +2406,18 @@ class LiteLLMBase(ABC):
                             yield ans
                         else:
                             reasoning_start = False
-                            answer += delta.content
+                            # Some models (MiniMax) leak a literal <tool_call>... text
+                            # into the content stream in ADDITION to the structured
+                            # tool_calls field. Strip it from the emitted answer so
+                            # the raw invocation JSON never reaches the user.
+                            _c = self._strip_tool_calls(delta.content) if delta.content else delta.content
+                            answer += _c
                             if _sanitizer is not None:
-                                emitted = _sanitizer.feed(delta.content)
+                                emitted = _sanitizer.feed(_c)
                                 if emitted:
                                     yield emitted
                             else:
-                                yield delta.content
+                                yield _c
 
                         if not _u["total_tokens"]:
                             round_estimate += num_tokens_from_string(delta.content)
